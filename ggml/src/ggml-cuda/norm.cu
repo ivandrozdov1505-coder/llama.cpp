@@ -81,6 +81,60 @@ static __global__ void group_norm_f32(const float * x, float * dst, const int gr
     }
 }
 
+#if !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA)
+// Use the same row partition and reduction as rms_norm_f32. Only the input
+// expression is fused, so residual arithmetic and normalization retain their order.
+static __device__ __forceinline__ float residual_mix_value(float a, float b, float alpha) {
+    return __fadd_rn(a, __fmul_rn(__fsub_rn(b, a), alpha));
+}
+
+template <int block_size>
+static __global__ void residual_mix_norm_f32(const float * a, const float * b, const float * alpha,
+                                            float * dst, const int ncols, const float eps,
+                                            const float scale_out) {
+    ggml_cuda_pdl_lc();
+    extern __shared__ float s_sum[];
+    const int64_t offset = int64_t(blockIdx.x) * ncols;
+    const int tid = threadIdx.x;
+    ggml_cuda_pdl_sync();
+
+    float sum = 0.0f;
+    for (int col = tid; col < ncols; col += block_size) {
+        const float xi = residual_mix_value(a[offset + col], b[offset + col], alpha[col]);
+        sum += xi * xi;
+    }
+    sum = block_reduce<block_reduce_method::SUM, block_size>(sum, s_sum);
+    const float mean = sum / ncols;
+    const float scale = rsqrtf(mean + eps);
+    for (int col = tid; col < ncols; col += block_size) {
+        const float xi = residual_mix_value(a[offset + col], b[offset + col], alpha[col]);
+        dst[offset + col] = scale_out * (scale * xi);
+    }
+}
+
+void ggml_cuda_op_residual_mix_norm(ggml_backend_cuda_context & ctx, const ggml_tensor * a,
+                                    const ggml_tensor * b, const ggml_tensor * alpha,
+                                    const ggml_tensor * norm, ggml_tensor * dst) {
+    float eps, scale;
+    memcpy(&eps, norm->op_params, sizeof(eps));
+    memcpy(&scale, dst->op_params, sizeof(scale));
+    const dim3 grid(ggml_nrows(dst));
+    const float * a_d = (const float *) a->data;
+    const float * b_d = (const float *) b->data;
+    const float * alpha_d = (const float *) alpha->data;
+    float * dst_d = (float *) dst->data;
+    if (dst->ne[0] < 1024) {
+        const ggml_cuda_kernel_launch_params params(grid, 256, 32 * sizeof(float), ctx.stream());
+        ggml_cuda_kernel_launch(residual_mix_norm_f32<256>, params, a_d, b_d, alpha_d, dst_d,
+                                int(dst->ne[0]), eps, scale);
+    } else {
+        const ggml_cuda_kernel_launch_params params(grid, 1024, 32 * sizeof(float), ctx.stream());
+        ggml_cuda_kernel_launch(residual_mix_norm_f32<1024>, params, a_d, b_d, alpha_d, dst_d,
+                                int(dst->ne[0]), eps, scale);
+    }
+}
+#endif
+
 template <int block_size, bool do_multiply = false, bool do_add = false, bool do_scale = false>
 static __global__ void rms_norm_f32(const float * x,
                                     float *       dst,

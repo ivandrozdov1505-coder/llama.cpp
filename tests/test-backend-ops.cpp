@@ -3789,6 +3789,71 @@ struct test_rms_norm_back : public test_case {
 };
 
 // GGML_OP_RMS_NORM + GGML_OP_MUL + GGML_OP_ADD (+ GGML_OP_MUL)
+// Exercise the complete Dory CUDA fusion patterns and their fallback paths.
+struct test_dory_cuda_fusion : public test_case {
+    const bool gate;
+    const std::array<int64_t, 4> ne;
+    const std::string layout;
+
+    test_dory_cuda_fusion(bool gate, std::array<int64_t, 4> ne, std::string layout)
+        : gate(gate), ne(ne), layout(layout) {}
+
+    std::string op_desc(ggml_tensor *) override {
+        return gate ? "DORY_ATTENTION_GATE" : "DORY_RESIDUAL_MIX_NORM";
+    }
+    std::string vars() override { return VARS_TO_STR3(gate, ne, layout); }
+    bool run_whole_graph() override { return true; }
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        ggml_tensor * a = ggml_new_tensor(ctx, GGML_TYPE_F32, 4, ne.data());
+        if (layout == "strided") {
+            ggml_tensor * base = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, ne[0] + 7, ne[1], ne[2], ne[3]);
+            a = ggml_view_4d(ctx, base, ne[0], ne[1], ne[2], ne[3],
+                             base->nb[1], base->nb[2], base->nb[3], 0);
+        }
+        ggml_tensor * b = ggml_new_tensor(ctx, GGML_TYPE_F32, 4, ne.data());
+        ggml_tensor * weight = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, layout == "scalar" ? 1 : ne[0]);
+        if (layout == "alias_weight") {
+            weight = ggml_view_1d(ctx, a, ne[0], 0);
+        }
+        // Materialize all inputs before the chain, as happens after Dory's matrix products.
+        b = ggml_add(ctx, b, weight);
+        if (layout != "alias_weight" && layout != "strided") {
+            a = ggml_scale(ctx, a, 1.0f);
+        }
+        ggml_tensor * intermediate;
+        ggml_tensor * mix;
+        if (gate) {
+            intermediate = ggml_mul(ctx, a, weight);
+            ggml_tensor * sigmoid = ggml_sigmoid(ctx, intermediate);
+            if (layout == "alias_weight") {
+                mix = ggml_mul_inplace(ctx, a, sigmoid);
+            } else {
+                mix = layout == "inplace" ? ggml_mul_inplace(ctx, b, sigmoid) : ggml_mul(ctx, b, sigmoid);
+            }
+        } else {
+            intermediate = ggml_sub(ctx, b, a);
+            ggml_tensor * weighted = ggml_mul(ctx, intermediate, weight);
+            mix = layout == "alias_weight" ? ggml_add_inplace(ctx, a, weighted) : ggml_add(ctx, a, weighted);
+        }
+        ggml_tensor * out = mix;
+        if (!gate && layout != "no_norm") {
+            out = ggml_rms_norm(ctx, mix, 1e-6f / ne[0]);
+            const float scale = 1.0f / sqrtf(ne[0]);
+            const float bias = layout == "bias" ? 0.25f : 0.0f;
+            out = layout == "inplace" ? ggml_scale_bias_inplace(ctx, out, scale, bias)
+                                      : ggml_scale_bias(ctx, out, scale, bias);
+        }
+        if (layout == "reuse") {
+            out = ggml_add(ctx, out, intermediate);
+        } else if (layout == "reuse_mix") {
+            out = ggml_add(ctx, out, mix);
+        }
+        ggml_set_name(out, "out");
+        return out;
+    }
+};
+
 struct test_rms_norm_mul_add : public test_case {
     const ggml_type type;
     const std::array<int64_t, 4> ne;
@@ -10377,6 +10442,20 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
         add_test_bin_bcast(type, {128, 1, 8, 1}, {1, 4, 1, 1});
         //add_test_bin_bcast(type, {3, 3, 2560, 1280}, {1, 1, 1, 1});
         //add_test_bin_bcast(type, {3, 3, 2560, 1280}, {2, 1, 1, 1});
+    }
+
+    // Decode and prompt batches, both normalization block sizes, and odd widths.
+    for (int64_t width : { 128, 513, 1024, 2560 }) {
+        for (int64_t tokens : { 1, 7 }) {
+            for (bool gate : { false, true }) {
+                test_cases.emplace_back(new test_dory_cuda_fusion(gate, { width, tokens, 1, 1 }, "contiguous"));
+            }
+        }
+    }
+    for (const char * layout : { "strided", "inplace", "reuse", "reuse_mix", "scalar", "bias", "no_norm", "alias_weight" }) {
+        for (bool gate : { false, true }) {
+            test_cases.emplace_back(new test_dory_cuda_fusion(gate, { 2560, 3, 2, 1 }, layout));
+        }
     }
 
     // single inplace tests, especially important for WebGPU backend since kernels for inplace vs. not are different

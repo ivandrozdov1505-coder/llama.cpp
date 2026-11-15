@@ -443,6 +443,51 @@ void ggml_cuda_op_add(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
     ggml_cuda_op_bin_bcast<bin_bcast_cuda<op_add>>(dst->src[0], dst->src[1], dst, dst->src[0]->data, dst->src[1]->data, dst->data, ctx.stream());
 }
 
+#if !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA)
+static __global__ void mul_sigmoid_mul_f32(const float * x, const float * weight, const float * other,
+                                           float * dst, const int64_t width) {
+    ggml_cuda_pdl_lc();
+    const int64_t col = int64_t(blockIdx.x) * blockDim.x + threadIdx.x;
+    if (col < width) {
+        const int64_t i = int64_t(blockIdx.y) * width + col;
+        ggml_cuda_pdl_sync();
+        const float scaled = __fmul_rn(x[i], weight[col]);
+        const float gate = 1.0f / (1.0f + expf(-scaled));
+        dst[i] = other[i] * gate;
+    }
+}
+
+void ggml_cuda_op_mul_sigmoid_mul(ggml_backend_cuda_context & ctx, const ggml_tensor * x,
+                                 const ggml_tensor * weight, const ggml_tensor * other, ggml_tensor * dst) {
+    constexpr int threads = 256;
+    const dim3 grid((dst->ne[0] + threads - 1) / threads, ggml_nrows(dst));
+    const ggml_cuda_kernel_launch_params params(grid, threads, 0, ctx.stream());
+    ggml_cuda_kernel_launch(mul_sigmoid_mul_f32, params, (const float *) x->data, (const float *) weight->data,
+                            (const float *) other->data, (float *) dst->data, dst->ne[0]);
+}
+
+static __global__ void residual_mix_f32(const float * a, const float * b, const float * alpha,
+                                        float * dst, const int64_t width) {
+    const int64_t col = int64_t(blockIdx.x) * blockDim.x + threadIdx.x;
+    if (col < width) {
+        const int64_t i = int64_t(blockIdx.y) * width + col;
+        ggml_cuda_pdl_sync();
+        const float base = a[i];
+        // Match the three F32 operations, including rounding before the addition.
+        dst[i] = base + __fmul_rn(b[i] - base, alpha[col]);
+    }
+}
+
+void ggml_cuda_op_residual_mix(ggml_backend_cuda_context & ctx, const ggml_tensor * a, const ggml_tensor * b,
+                               const ggml_tensor * alpha, ggml_tensor * dst) {
+    constexpr int threads = 256;
+    const dim3 grid((dst->ne[0] + threads - 1) / threads, ggml_nrows(dst));
+    const ggml_cuda_kernel_launch_params params(grid, threads, 0, ctx.stream());
+    ggml_cuda_kernel_launch(residual_mix_f32, params, (const float *) a->data, (const float *) b->data,
+                            (const float *) alpha->data, (float *) dst->data, dst->ne[0]);
+}
+#endif
+
 void ggml_cuda_op_sub(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
     ggml_cuda_op_bin_bcast<bin_bcast_cuda<op_sub>>(dst->src[0], dst->src[1], dst, dst->src[0]->data, dst->src[1]->data, dst->data, ctx.stream());
 }

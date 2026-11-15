@@ -3614,6 +3614,17 @@ static bool ggml_cuda_can_fuse(const struct ggml_cgraph *                cgraph,
     return false;
 }
 
+#if !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA)
+// Equal contiguous inputs can be updated elementwise in place. Partial overlap
+// and broadcast inputs sharing the output storage would race across threads.
+static bool ggml_cuda_elementwise_input_is_safe(const ggml_tensor * src, const ggml_tensor * dst) {
+    const uintptr_t src_addr = (uintptr_t) src->data;
+    const uintptr_t dst_addr = (uintptr_t) dst->data;
+    return (src_addr == dst_addr && ggml_are_same_shape(src, dst)) ||
+           src_addr + ggml_nbytes(src) <= dst_addr || dst_addr + ggml_nbytes(dst) <= src_addr;
+}
+#endif
+
 // try and fuse nodes and return the number of nodes to skip
 static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph * cgraph, int i) {
 
@@ -3769,6 +3780,60 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
         ggml_cuda_op_rope_fused(*cuda_ctx, rope, set_rows);
         return 2;
     }
+
+#if !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA)
+    // Dory attention gate: sigmoid(x * weight) * attention_output.
+    if (node->op == GGML_OP_MUL && ggml_can_fuse(cgraph, i, { GGML_OP_MUL, GGML_OP_UNARY, GGML_OP_MUL })) {
+        const ggml_tensor * sigmoid = cgraph->nodes[i + 1];
+        ggml_tensor * dst = cgraph->nodes[i + 2];
+        const ggml_tensor * x = node->src[0];
+        const ggml_tensor * weight = node->src[1];
+        const ggml_tensor * other = dst->src[0];
+        if (ggml_get_unary_op(sigmoid) == GGML_UNARY_OP_SIGMOID && dst->src[1] == sigmoid &&
+            x->type == GGML_TYPE_F32 && weight->type == GGML_TYPE_F32 && other->type == GGML_TYPE_F32 &&
+            ggml_are_same_shape(x, dst) && ggml_are_same_shape(other, dst) &&
+            ggml_nrows(weight) == 1 && weight->ne[0] == dst->ne[0] && ggml_nrows(dst) <= 65535 &&
+            ggml_is_contiguous(x) && ggml_is_contiguous(weight) && ggml_is_contiguous(other) &&
+            ggml_is_contiguous(dst) && ggml_cuda_elementwise_input_is_safe(x, dst) &&
+            ggml_cuda_elementwise_input_is_safe(weight, dst) && ggml_cuda_elementwise_input_is_safe(other, dst)) {
+            ggml_cuda_op_mul_sigmoid_mul(*cuda_ctx, x, weight, other, dst);
+            return 2;
+        }
+    }
+
+    // Dory residual update: a + (b - a) * alpha, with one coefficient per column.
+    if (node->op == GGML_OP_SUB && ggml_can_fuse(cgraph, i, { GGML_OP_SUB, GGML_OP_MUL, GGML_OP_ADD })) {
+        ggml_tensor * mul = cgraph->nodes[i + 1];
+        ggml_tensor * add = cgraph->nodes[i + 2];
+        const ggml_tensor * b = node->src[0];
+        const ggml_tensor * a = node->src[1];
+        const ggml_tensor * alpha = mul->src[1];
+
+        const bool with_norm = ggml_can_fuse(cgraph, i,
+            { GGML_OP_SUB, GGML_OP_MUL, GGML_OP_ADD, GGML_OP_RMS_NORM, GGML_OP_SCALE });
+        ggml_tensor * dst = with_norm ? cgraph->nodes[i + 4] : add;
+        float bias = 0.0f;
+        if (with_norm) {
+            memcpy(&bias, (const float *) dst->op_params + 1, sizeof(bias));
+        }
+
+        if (mul->src[0] == node && add->src[0] == a && add->src[1] == mul &&
+            a->type == GGML_TYPE_F32 && b->type == GGML_TYPE_F32 && alpha->type == GGML_TYPE_F32 &&
+            ggml_are_same_shape(a, add) && ggml_are_same_shape(b, add) &&
+            ggml_nrows(alpha) == 1 && alpha->ne[0] == add->ne[0] && ggml_nrows(add) <= 65535 &&
+            ggml_is_contiguous(a) && ggml_is_contiguous(b) && ggml_is_contiguous(alpha) &&
+            ggml_is_contiguous(add) && ggml_is_contiguous(dst) && dst->type == GGML_TYPE_F32 &&
+            bias == 0.0f && ggml_cuda_elementwise_input_is_safe(a, dst) &&
+            ggml_cuda_elementwise_input_is_safe(b, dst) && ggml_cuda_elementwise_input_is_safe(alpha, dst)) {
+            if (with_norm) {
+                ggml_cuda_op_residual_mix_norm(*cuda_ctx, a, b, alpha, cgraph->nodes[i + 3], dst);
+                return 4;
+            }
+            ggml_cuda_op_residual_mix(*cuda_ctx, a, b, alpha, add);
+            return 2;
+        }
+    }
+#endif
 
     // Snake activation: y = x + sin(a*x)^2 * inv_b
     // Naive 5-op decomposition emitted by frontends: mul -> sin -> sqr -> mul -> add
