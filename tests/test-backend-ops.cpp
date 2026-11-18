@@ -7653,7 +7653,10 @@ struct test_mul_mat_vec_fusion : public test_case {
     }
 
     bool run_whole_graph() override { return true; }
-    bool use_weight_context() override { return use_id && with_lane_scale; }
+    bool row_scale() const {
+        return !use_id && with_lane_scale && (type == GGML_TYPE_Q5_K || type == GGML_TYPE_Q6_K);
+    }
+    bool use_weight_context() override { return with_lane_scale && (use_id || row_scale()); }
 
     ggml_tensor * build_gate(ggml_context * ctx, ggml_tensor * ffn_gate, ggml_tensor * ffn_up) {
         ggml_tensor * out = nullptr;
@@ -7672,8 +7675,9 @@ struct test_mul_mat_vec_fusion : public test_case {
         return out;
     }
 
-    ggml_tensor * build_lane_scale_dense(ggml_context * ctx, ggml_tensor * out) {
-        ggml_tensor * scale = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, 1);
+    ggml_tensor * build_lane_scale_dense(ggml_context * ctx, ggml_context * ctx_weights, ggml_tensor * out) {
+        ggml_tensor * scale = row_scale() ? ggml_new_tensor_1d(ctx_weights, GGML_TYPE_F32, out->ne[0])
+                                         : ggml_new_tensor_1d(ctx, GGML_TYPE_F32, 1);
         return ggml_mul(ctx, out, scale);
     }
 
@@ -7699,13 +7703,14 @@ struct test_mul_mat_vec_fusion : public test_case {
             std::array<int64_t, 4> ne0      = { k, n, channels, samples };
 
             ggml_tensor * cur  = ggml_new_tensor(ctx, GGML_TYPE_F32, 4, ne.data());
-            ggml_tensor * gate = with_gate ? ggml_new_tensor(ctx, type, 4, ne0.data()) : nullptr;
-            ggml_tensor * up   = ggml_new_tensor(ctx, type, 4, ne0.data());
+            ggml_context * weight_ctx = row_scale() ? ctx_weights : ctx;
+            ggml_tensor * gate = with_gate ? ggml_new_tensor(weight_ctx, type, 4, ne0.data()) : nullptr;
+            ggml_tensor * up   = ggml_new_tensor(weight_ctx, type, 4, ne0.data());
 
             auto build_lane_up = [&]() {
                 ggml_tensor * ffn_up = ggml_mul_mat(ctx, up, cur);
                 if (with_lane_scale) {
-                    ffn_up = build_lane_scale_dense(ctx, ffn_up);
+                    ffn_up = build_lane_scale_dense(ctx, ctx_weights, ffn_up);
                 }
                 if (with_bias) {
                     std::array<int64_t, 4> bias_ne = { ffn_up->ne[0], 1, channels, samples };
@@ -7718,7 +7723,7 @@ struct test_mul_mat_vec_fusion : public test_case {
             auto build_lane_gate = [&]() {
                 ggml_tensor * ffn_gate = ggml_mul_mat(ctx, gate, cur);
                 if (with_lane_scale) {
-                    ffn_gate = build_lane_scale_dense(ctx, ffn_gate);
+                    ffn_gate = build_lane_scale_dense(ctx, ctx_weights, ffn_gate);
                 }
                 if (with_bias) {
                     std::array<int64_t, 4> bias_ne   = { ffn_gate->ne[0], 1, channels, samples };
@@ -11901,6 +11906,16 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     for (bool b : {false, true}) {
         test_cases.emplace_back(new test_mul_mat_vec_fusion(GGML_TYPE_IQ2_S, GGML_GLU_OP_SWIGLU_CLAMP, 1, 32, 256,
             true, 16, 8, b, false, true, false));
+    }
+
+    // Dory's single-token row scales, with and without the paired SwiGLU projection.
+    for (ggml_type type : {GGML_TYPE_Q5_K, GGML_TYPE_Q6_K}) {
+        for (bool with_gate : {false, true}) {
+            for (int64_t m_batch : {1, 2}) {
+                test_cases.emplace_back(new test_mul_mat_vec_fusion(type, GGML_GLU_OP_SWIGLU, m_batch, 7168, 2560,
+                    false, 1, 1, false, false, with_gate, true, {1, 1}));
+            }
+        }
     }
 
     // Fused row-pair coverage: minimum rows, an even pair, and an odd tail.

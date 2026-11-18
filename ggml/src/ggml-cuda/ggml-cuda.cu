@@ -3921,7 +3921,8 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
     bool fused_mul_mat_vec = false;
     int  fused_node_count  = 0;
 
-    auto get_mul_mat_scale = [](const ggml_tensor * scale_node, const ggml_tensor * mm_node) -> const ggml_tensor * {
+    auto get_mul_mat_scale = [cuda_ctx](const ggml_tensor * scale_node, const ggml_tensor * mm_node,
+                                       const ggml_tensor * dst, bool allow_row_scale) -> const ggml_tensor * {
         const bool scale_lhs_mm = scale_node->src[0] == mm_node;
         const bool scale_rhs_mm = scale_node->src[1] == mm_node;
         if (!scale_lhs_mm && !scale_rhs_mm) {
@@ -3929,13 +3930,39 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
         }
 
         const ggml_tensor * scale = scale_lhs_mm ? scale_node->src[1] : scale_node->src[0];
-        if (mm_node->src[0]->type != GGML_TYPE_NVFP4 || scale_node->type != GGML_TYPE_F32 ||
-                scale->type != GGML_TYPE_F32 || !ggml_is_contiguous(scale) || ggml_nelements(scale) != 1 ||
-                !ggml_are_same_shape(scale_node, mm_node)) {
+        if (scale_node->type != GGML_TYPE_F32 || scale->type != GGML_TYPE_F32 ||
+                !ggml_is_contiguous(scale) || !ggml_are_same_shape(scale_node, mm_node)) {
             return nullptr;
         }
 
-        return scale;
+        const ggml_tensor * weight = mm_node->src[0];
+        if (weight->type == GGML_TYPE_NVFP4) {
+            return ggml_nelements(scale) == 1 ? scale : nullptr;
+        }
+
+        // Row coefficients use the regular MMVQ dot product and are applied only at writeback.
+        const ggml_tensor * input = mm_node->src[1];
+        const int cc = ggml_cuda_info().devices[cuda_ctx->device].cc;
+        if (!allow_row_scale || !GGML_CUDA_CC_IS_NVIDIA(cc) ||
+                (weight->type != GGML_TYPE_Q5_K && weight->type != GGML_TYPE_Q6_K) ||
+                !ggml_cuda_should_use_mmvq(weight->type, cc, input->ne[1]) ||
+                ggml_cuda_op_mul_mat_use_fwht(mm_node) ||
+                !ggml_is_matrix(weight) || !ggml_is_contiguous(weight) ||
+                !ggml_is_contiguous(input) || !ggml_is_contiguous(dst) ||
+                ggml_nrows(input) != 1 || ggml_nrows(dst) != 1 || dst->type != GGML_TYPE_F32 ||
+                !ggml_are_same_shape(dst, mm_node) ||
+                ggml_nrows(scale) != 1 || scale->ne[0] != dst->ne[0] ||
+                ggml_backend_buffer_get_usage(weight->buffer) != GGML_BACKEND_BUFFER_USAGE_WEIGHTS) {
+            return nullptr;
+        }
+
+        // The matvec reads its inputs across multiple blocks. Reject any overlap.
+        const auto overlaps_dst = [dst](const ggml_tensor * src) {
+            const auto src_addr = reinterpret_cast<uintptr_t>(src->data);
+            const auto dst_addr = reinterpret_cast<uintptr_t>(dst->data);
+            return src_addr < dst_addr + ggml_nbytes(dst) && dst_addr < src_addr + ggml_nbytes(src);
+        };
+        return overlaps_dst(weight) || overlaps_dst(input) || overlaps_dst(scale) ? nullptr : scale;
     };
 
     auto get_mul_mat_id_scale = [](const ggml_tensor * reshape, const ggml_tensor * repeat, const ggml_tensor * getrows,
@@ -4024,8 +4051,8 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
                     continue;
                 }
 
-                const ggml_tensor * gate_scale = get_mul_mat_scale(gate_scale_n, gate_n);
-                const ggml_tensor * up_scale   = get_mul_mat_scale(up_scale_n, up_n);
+                const ggml_tensor * gate_scale = get_mul_mat_scale(gate_scale_n, gate_n, glu, !with_bias && ggml_get_glu_op(glu) == GGML_GLU_OP_SWIGLU);
+                const ggml_tensor * up_scale   = get_mul_mat_scale(up_scale_n, up_n, glu, !with_bias && ggml_get_glu_op(glu) == GGML_GLU_OP_SWIGLU);
                 if (!gate_scale || !up_scale) {
                     continue;
                 }
@@ -4314,7 +4341,7 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
 
             const ggml_tensor * scale = nullptr;
             if (op == GGML_OP_MUL_MAT) {
-                scale = get_mul_mat_scale(scale_node, mm_node);
+                scale = get_mul_mat_scale(scale_node, mm_node, out_node, !with_bias);
             } else {
                 scale = get_mul_mat_id_scale(cgraph->nodes[i + 1], cgraph->nodes[i + 2], cgraph->nodes[i + 3], scale_node, mm_node);
             }
