@@ -168,7 +168,7 @@ static __global__ void rms_norm_f32(const float * x,
     const int tid   = threadIdx.x;
 
     static_assert(!do_add || do_multiply, "fusing add is not supported without multiplying");
-    static_assert(!do_scale || !do_multiply, "fusing scale is not supported with multiplying");
+    static_assert(!do_scale || !do_add, "scalar scaling with a fused add is not supported");
 
     extern __shared__ float s_sum[];
 
@@ -216,7 +216,12 @@ static __global__ void rms_norm_f32(const float * x,
                     dstc[col]         = scale * xc[col] * mulc[mul_col] + addc[add_col];
                 } else if constexpr (do_multiply) {
                     const int mul_col = fastmodulo(col, mul_ncols_packed);
-                    dstc[col]         = scale * xc[col] * mulc[mul_col];
+                    const float normalized = scale * xc[col];
+                    if constexpr (do_scale) {
+                        dstc[col] = (scale_out * normalized) * mulc[mul_col];
+                    } else {
+                        dstc[col] = normalized * mulc[mul_col];
+                    }
                 } else if constexpr (do_scale) {
                     dstc[col] = scale_out * (scale * xc[col]);
                 } else {
@@ -612,6 +617,30 @@ void ggml_cuda_op_rms_norm_scale_fused(ggml_backend_cuda_context & ctx, ggml_ten
 
     rms_norm_f32_cuda<true>(src0_d, dst_d, ne00, ne01, ne02, ne03, s01, s02, s03, eps, stream, scale);
 }
+
+#if !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA)
+void ggml_cuda_op_rms_norm_scale_mul(ggml_backend_cuda_context & ctx, const ggml_tensor * norm,
+                                    const ggml_tensor * scale, const ggml_tensor * weight, ggml_tensor * dst) {
+    const ggml_tensor * x = norm->src[0];
+    const int ncols = x->ne[0];
+    const int nrows = x->ne[1];
+    float eps, scale_out;
+    memcpy(&eps, norm->op_params, sizeof(eps));
+    memcpy(&scale_out, scale->op_params, sizeof(scale_out));
+
+    constexpr int block_size = 256;
+    const size_t shared_bytes = 32 * sizeof(float);
+    const ggml_cuda_kernel_launch_params params(dim3(nrows), block_size, shared_bytes, ctx.stream());
+    const uint3 one = init_fastdiv_values(1);
+    const uint3 unused = make_uint3(0, 0, 0);
+    ggml_cuda_kernel_launch(rms_norm_f32<block_size, true, false, true>, params,
+        (const float *) x->data, (float *) dst->data, ncols, 1, 1,
+        int64_t(ncols), int64_t(ncols) * nrows, int64_t(ncols) * nrows, eps,
+        (const float *) weight->data, int64_t(ncols), int64_t(0), int64_t(0),
+        init_fastdiv_values(ncols), init_fastdiv_values(nrows), one, one,
+        nullptr, 0, 0, 0, unused, unused, unused, unused, scale_out);
+}
+#endif
 
 void ggml_cuda_op_rms_norm_fused(ggml_backend_cuda_context & ctx, ggml_tensor * dst, ggml_tensor * mul_tensor) {
     const ggml_tensor * rms_norm_src = (ggml_tensor *) dst->src[0];

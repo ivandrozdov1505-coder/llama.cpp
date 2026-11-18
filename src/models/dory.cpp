@@ -192,7 +192,10 @@ std::unique_ptr<llm_graph_context> llama_model_dory::build_arch_graph(const llm_
 llama_model_dory::graph::graph(const llama_model_dory & model, const llm_graph_params & params) : llm_graph_context(params) {
     ggml_tensor * cur = build_inp_embd(model.tok_embd);
     ggml_tensor * pos = build_inp_pos();
-    ggml_tensor * out_ids = build_inp_out_ids();
+    // A single requested token is already in output order. Keep the gather
+    // for pipeline graphs and batches that may select a subset of rows.
+    ggml_tensor * out_ids = n_tokens == 1 && n_outputs == 1 && !cparams.pipeline_parallel
+        ? nullptr : build_inp_out_ids();
     auto * attn = build_attn_inp_kv_iswa();
     ggml_tensor * input_h = nullptr;
     const int recurrent_end = model.n_input + model.n_recurrent * model.n_loops;

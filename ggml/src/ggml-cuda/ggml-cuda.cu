@@ -4465,6 +4465,30 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
         return 1;
     }
 
+#if !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA)
+    // Dory decodes one query per head. The reshaped coefficient is a view of
+    // already prepared weights and requires no computation of its own.
+    if (node->op == GGML_OP_RMS_NORM && ggml_can_fuse_subgraph(cgraph, i,
+            { GGML_OP_RMS_NORM, GGML_OP_SCALE, GGML_OP_RESHAPE, GGML_OP_MUL }, { i + 3 })) {
+        const ggml_tensor * scale = cgraph->nodes[i + 1];
+        const ggml_tensor * weight = cgraph->nodes[i + 2];
+        ggml_tensor * dst = cgraph->nodes[i + 3];
+        const ggml_tensor * x = node->src[0];
+        float bias;
+        memcpy(&bias, (const float *) scale->op_params + 1, sizeof(bias));
+        if (bias == 0.0f && scale->src[0] == node && dst->src[0] == scale && dst->src[1] == weight &&
+            weight->src[0]->op == GGML_OP_NONE && x->type == GGML_TYPE_F32 &&
+            weight->type == GGML_TYPE_F32 && dst->type == GGML_TYPE_F32 &&
+            x->ne[0] > 0 && x->ne[0] < 1024 && x->ne[1] > 0 && x->ne[1] <= INT_MAX &&
+            ggml_is_matrix(x) && ggml_are_same_shape(x, weight) && ggml_are_same_shape(x, dst) &&
+            ggml_is_contiguous(x) && ggml_is_contiguous(weight) && ggml_is_contiguous(dst) &&
+            ggml_cuda_elementwise_input_is_safe(x, dst) && ggml_cuda_elementwise_input_is_safe(weight, dst)) {
+            ggml_cuda_op_rms_norm_scale_mul(*cuda_ctx, node, scale, weight, dst);
+            return 3;
+        }
+    }
+#endif
+
     if (ggml_cuda_can_fuse(cgraph, i, { GGML_OP_RMS_NORM, GGML_OP_SCALE }, {})) {
         ggml_cuda_op_rms_norm_scale_fused(*cuda_ctx, node, cgraph->nodes[i + 1]);
         return 1;

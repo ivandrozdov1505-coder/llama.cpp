@@ -24,3 +24,8 @@ void ggml_cuda_op_residual_mix_norm(ggml_backend_cuda_context & ctx, const ggml_
                                     const ggml_tensor * b, const ggml_tensor * alpha,
                                     const ggml_tensor * norm, ggml_tensor * dst);
 #endif
+
+#if !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA)
+void ggml_cuda_op_rms_norm_scale_mul(ggml_backend_cuda_context & ctx, const ggml_tensor * norm,
+                                    const ggml_tensor * scale, const ggml_tensor * weight, ggml_tensor * dst);
+#endif

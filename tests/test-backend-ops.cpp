@@ -3789,6 +3789,33 @@ struct test_rms_norm_back : public test_case {
 };
 
 // GGML_OP_RMS_NORM + GGML_OP_MUL + GGML_OP_ADD (+ GGML_OP_MUL)
+struct test_dory_query_norm : public test_case {
+    const int64_t tokens;
+    const float bias;
+
+    test_dory_query_norm(int64_t tokens, float bias) : tokens(tokens), bias(bias) {}
+
+    std::string op_desc(ggml_tensor *) override { return "DORY_QUERY_NORM"; }
+    std::string vars() override { return VARS_TO_STR2(tokens, bias); }
+    bool run_whole_graph() override { return true; }
+    bool use_weight_context() override { return true; }
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        GGML_UNUSED(ctx);
+        GGML_ABORT("query normalization requires a weight context");
+    }
+
+    ggml_tensor * build_graph(ggml_context * ctx, ggml_context * ctx_weights) override {
+        constexpr int64_t head_dim = 128;
+        constexpr int64_t heads = 32;
+        auto * q = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, head_dim, heads, tokens);
+        auto * weight = ggml_new_tensor_1d(ctx_weights, GGML_TYPE_F32, head_dim * heads);
+        q = ggml_rms_norm(ctx, q, 1e-6f / head_dim);
+        q = ggml_scale_bias(ctx, q, 1.0f / sqrtf(head_dim), bias);
+        return ggml_mul(ctx, q, ggml_reshape_3d(ctx, weight, head_dim, heads, 1));
+    }
+};
+
 // Exercise the complete Dory CUDA fusion patterns and their fallback paths.
 struct test_dory_cuda_fusion : public test_case {
     const bool gate;
@@ -10448,6 +10475,10 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
         //add_test_bin_bcast(type, {3, 3, 2560, 1280}, {1, 1, 1, 1});
         //add_test_bin_bcast(type, {3, 3, 2560, 1280}, {2, 1, 1, 1});
     }
+
+    test_cases.emplace_back(new test_dory_query_norm(1, 0.0f));
+    test_cases.emplace_back(new test_dory_query_norm(1, 0.25f)); // nonzero scale bias keeps the separate ops
+    test_cases.emplace_back(new test_dory_query_norm(7, 0.0f)); // prompt batch keeps the separate ops
 
     // Decode and prompt batches, both normalization block sizes, and odd widths.
     for (int64_t width : { 128, 513, 1024, 2560 }) {
