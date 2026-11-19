@@ -15,6 +15,9 @@
 
 #include <atomic>
 #include <clocale>
+#include <cstdio>
+#include <cstdlib>
+#include <cstring>
 #include <exception>
 #include <mutex>
 #include <signal.h>
@@ -804,6 +807,19 @@ int llama_server(int argc, char ** argv) {
 
     if (!common_params_parse(argc, argv, params, LLAMA_EXAMPLE_SERVER)) {
         return 1;
+    }
+
+    if (std::getenv("DORY_WORKBENCH_TRACE")) {
+        params.cb_eval = [](ggml_tensor * tensor, bool ask, void *) {
+            constexpr char prefix[] = "dory_round:";
+            const char * name = ggml_get_name(tensor);
+            const bool marker = std::strncmp(name, prefix, sizeof(prefix) - 1) == 0;
+            if (!ask && marker) {
+                std::fprintf(stderr, "DORY_CYCLE %s\n", name + sizeof(prefix) - 1);
+                std::fflush(stderr);
+            }
+            return ask ? marker : true;
+        };
     }
 
     SRV_INF("%s", "initializing ...\n");

@@ -1,5 +1,6 @@
 #include "models.h"
 
+#include <cstdlib>
 #include <stdexcept>
 #include "ggml-alloc.h"
 
@@ -199,6 +200,7 @@ llama_model_dory::graph::graph(const llama_model_dory & model, const llm_graph_p
     auto * attn = build_attn_inp_kv_iswa();
     ggml_tensor * input_h = nullptr;
     const int recurrent_end = model.n_input + model.n_recurrent * model.n_loops;
+    const bool trace_rounds = std::getenv("DORY_WORKBENCH_TRACE") != nullptr;
     const auto norm = [&](ggml_tensor * x) { return build_gdn_l2_norm(ctx0, x, 1e-6f); };
     auto frozen_ptr = std::make_unique<dory_frozen_scales>(ctx0);
     auto * frozen = frozen_ptr.get();
@@ -264,10 +266,15 @@ llama_model_dory::graph::graph(const llama_model_dory & model, const llm_graph_p
         auto * b = norm(cur);
         auto * alpha = cs.alpha;
         cur = norm(ggml_add(ctx0, a, ggml_mul(ctx0, ggml_sub(ctx0, b, a), alpha)));
-        if (il >= (int) model.n_input && il < recurrent_end && (il + 1 - model.n_input) % model.n_recurrent == 0) {
+        const bool round_end = il >= (int) model.n_input && il < recurrent_end &&
+                               (il + 1 - model.n_input) % model.n_recurrent == 0;
+        if (round_end) {
             cur = norm(cur);
         }
         cb(cur, "l_out", il);
+        if (trace_rounds && round_end) {
+            ggml_format_name(cur, "dory_round:%u/%u", (il - model.n_input) / model.n_recurrent + 1, model.n_loops);
+        }
     }
     if (out_ids) {
         cur = ggml_get_rows(ctx0, cur, out_ids);
