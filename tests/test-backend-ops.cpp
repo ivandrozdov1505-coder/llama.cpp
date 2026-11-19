@@ -3792,11 +3792,13 @@ struct test_rms_norm_back : public test_case {
 struct test_dory_query_norm : public test_case {
     const int64_t tokens;
     const float bias;
+    const int64_t head_dim;
 
-    test_dory_query_norm(int64_t tokens, float bias) : tokens(tokens), bias(bias) {}
+    test_dory_query_norm(int64_t tokens, float bias, int64_t head_dim = 128)
+        : tokens(tokens), bias(bias), head_dim(head_dim) {}
 
     std::string op_desc(ggml_tensor *) override { return "DORY_QUERY_NORM"; }
-    std::string vars() override { return VARS_TO_STR2(tokens, bias); }
+    std::string vars() override { return VARS_TO_STR3(tokens, bias, head_dim); }
     bool run_whole_graph() override { return true; }
     bool use_weight_context() override { return true; }
 
@@ -3806,7 +3808,6 @@ struct test_dory_query_norm : public test_case {
     }
 
     ggml_tensor * build_graph(ggml_context * ctx, ggml_context * ctx_weights) override {
-        constexpr int64_t head_dim = 128;
         constexpr int64_t heads = 32;
         auto * q = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, head_dim, heads, tokens);
         auto * weight = ggml_new_tensor_1d(ctx_weights, GGML_TYPE_F32, head_dim * heads);
@@ -10478,7 +10479,12 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
 
     test_cases.emplace_back(new test_dory_query_norm(1, 0.0f));
     test_cases.emplace_back(new test_dory_query_norm(1, 0.25f)); // nonzero scale bias keeps the separate ops
-    test_cases.emplace_back(new test_dory_query_norm(7, 0.0f)); // prompt batch keeps the separate ops
+    test_cases.emplace_back(new test_dory_query_norm(7, 0.0f));
+    test_cases.emplace_back(new test_dory_query_norm(7, 0.0f, 513));
+    test_cases.emplace_back(new test_dory_query_norm(7, 0.25f));
+
+    test_cases.emplace_back(new test_dory_cuda_fusion(false, { 4096, 3, 1, 1 }, "contiguous"));
+    test_cases.emplace_back(new test_dory_cuda_fusion(false, { 4097, 3, 1, 1 }, "contiguous"));
 
     // Decode and prompt batches, both normalization block sizes, and odd widths.
     for (int64_t width : { 128, 513, 1024, 2560 }) {
