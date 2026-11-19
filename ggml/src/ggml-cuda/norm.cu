@@ -81,6 +81,65 @@ static __global__ void group_norm_f32(const float * x, float * dst, const int gr
     }
 }
 
+#if !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA)
+// Use the same row partition and reduction as rms_norm_f32. Only the input
+// expression is fused, so residual arithmetic and normalization retain their order.
+static __device__ __forceinline__ float residual_mix_value(float a, float b, float alpha) {
+    return __fadd_rn(a, __fmul_rn(__fsub_rn(b, a), alpha));
+}
+
+template <int block_size, bool cache_mix = true>
+static __global__ void residual_mix_norm_f32(const float * a, const float * b, const float * alpha,
+                                            float * dst, const int ncols, const float eps,
+                                            const float scale_out) {
+    ggml_cuda_pdl_lc();
+    extern __shared__ float s_sum[];
+    const int64_t offset = int64_t(blockIdx.x) * ncols;
+    const int tid = threadIdx.x;
+    ggml_cuda_pdl_sync();
+
+    float sum = 0.0f;
+    for (int col = tid; col < ncols; col += block_size) {
+        const float xi = residual_mix_value(a[offset + col], b[offset + col], alpha[col]);
+        if constexpr (cache_mix) {
+            s_sum[WARP_SIZE + col] = xi;
+        }
+        sum += xi * xi;
+    }
+    sum = block_reduce<block_reduce_method::SUM, block_size>(sum, s_sum);
+    const float mean = sum / ncols;
+    const float scale = rsqrtf(mean + eps);
+    for (int col = tid; col < ncols; col += block_size) {
+        const float xi = cache_mix ? s_sum[WARP_SIZE + col] : residual_mix_value(a[offset + col], b[offset + col], alpha[col]);
+        dst[offset + col] = scale_out * (scale * xi);
+    }
+}
+
+void ggml_cuda_op_residual_mix_norm(ggml_backend_cuda_context & ctx, const ggml_tensor * a,
+                                    const ggml_tensor * b, const ggml_tensor * alpha,
+                                    const ggml_tensor * norm, ggml_tensor * dst) {
+    float eps, scale;
+    memcpy(&eps, norm->op_params, sizeof(eps));
+    memcpy(&scale, dst->op_params, sizeof(scale));
+    const dim3 grid(ggml_nrows(dst));
+    const float * a_d = (const float *) a->data;
+    const float * b_d = (const float *) b->data;
+    const float * alpha_d = (const float *) alpha->data;
+    float * dst_d = (float *) dst->data;
+    // Each thread consumes its own cached columns after the block reduction.
+    const int ncols = int(dst->ne[0]);
+    const int block_size = ncols < 1024 ? 256 : 1024;
+    const bool cache_mix = ncols <= 4096;
+    const size_t scratch = (WARP_SIZE + (cache_mix ? ncols : 0)) * sizeof(float);
+    auto kernel = residual_mix_norm_f32<1024, false>;
+    if (cache_mix) {
+        kernel = ncols < 1024 ? residual_mix_norm_f32<256> : residual_mix_norm_f32<1024>;
+    }
+    const ggml_cuda_kernel_launch_params params(grid, block_size, scratch, ctx.stream());
+    ggml_cuda_kernel_launch(kernel, params, a_d, b_d, alpha_d, dst_d, ncols, eps, scale);
+}
+#endif
+
 template <int block_size, int vpt, bool do_vec, bool do_multiply = false, bool do_add = false, bool do_scale = false>
 static __global__ void rms_norm_f32(const float * x,
                                     float *       dst,
@@ -636,6 +695,55 @@ void ggml_cuda_op_rms_norm_scale_fused(ggml_backend_cuda_context & ctx, ggml_ten
 
     rms_norm_f32_cuda<true>(src0, dst_d, ne00, ne01, ne02, ne03, s01, s02, s03, eps, stream, scale);
 }
+
+#if !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA)
+// One CTA per (head, token). Retain the query in registers across the reduction.
+template <int items_per_thread>
+static __global__ void rms_norm_scale_head_mul(const float * x, const float * weight, float * dst,
+                                               int ncols, float eps, float scale_out) {
+    ggml_cuda_pdl_lc();
+    constexpr int block_size = 256;
+    const int64_t offset = (int64_t(blockIdx.y) * gridDim.x + blockIdx.x) * ncols;
+    const int64_t weight_offset = int64_t(blockIdx.x) * ncols;
+    float values[items_per_thread];
+    float sum = 0.0f;
+    ggml_cuda_pdl_sync();
+
+#pragma unroll
+    for (int i = 0; i < items_per_thread; ++i) {
+        const int col = threadIdx.x + i * block_size;
+        if (col < ncols) {
+            values[i] = x[offset + col];
+            sum += values[i] * values[i];
+        }
+    }
+    __shared__ float warp_sums[block_size / WARP_SIZE];
+    sum = block_reduce<block_reduce_method::SUM, block_size>(sum, warp_sums);
+    const float inv_rms = rsqrtf(sum / ncols + eps);
+#pragma unroll
+    for (int i = 0; i < items_per_thread; ++i) {
+        const int col = threadIdx.x + i * block_size;
+        if (col < ncols) {
+            dst[offset + col] = (scale_out * (inv_rms * values[i])) * weight[weight_offset + col];
+        }
+    }
+}
+
+void ggml_cuda_op_rms_norm_scale_mul(ggml_backend_cuda_context & ctx, const ggml_tensor * norm,
+                                    const ggml_tensor * scale, const ggml_tensor * weight, ggml_tensor * dst) {
+    const ggml_tensor * x = norm->src[0];
+    const int ncols = x->ne[0];
+    const int nrows = x->ne[1];
+    float eps, scale_out;
+    memcpy(&eps, norm->op_params, sizeof(eps));
+    memcpy(&scale_out, scale->op_params, sizeof(scale_out));
+
+    const ggml_cuda_kernel_launch_params params(dim3(nrows, x->ne[2]), 256, 0, ctx.stream());
+    const auto kernel = ncols <= 256 ? rms_norm_scale_head_mul<1> : rms_norm_scale_head_mul<4>;
+    ggml_cuda_kernel_launch(kernel, params, (const float *) x->data, (const float *) weight->data,
+                            (float *) dst->data, ncols, eps, scale_out);
+}
+#endif
 
 void ggml_cuda_op_rms_norm_fused(ggml_backend_cuda_context & ctx, ggml_tensor * dst, ggml_tensor * mul_tensor) {
     const ggml_tensor * rms_norm_src = (ggml_tensor *) dst->src[0];

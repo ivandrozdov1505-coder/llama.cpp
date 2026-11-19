@@ -2332,7 +2332,8 @@ static bool ggml_cuda_match_shared_expert(const ggml_cgraph * graph, int routed_
 
 // The weight scale that scale_node (MUL) applies to the output of mm_node (MUL_MAT), or nullptr.
 // Shared by ggml_cuda_try_fuse and graph_optimize so that both accept the same patterns.
-static const ggml_tensor * ggml_cuda_get_mul_mat_scale(const ggml_tensor * scale_node, const ggml_tensor * mm_node) {
+static const ggml_tensor * ggml_cuda_get_mul_mat_scale(const ggml_tensor * scale_node, const ggml_tensor * mm_node,
+                                                      const ggml_tensor * dst = nullptr) {
     const bool scale_lhs_mm = scale_node->src[0] == mm_node;
     const bool scale_rhs_mm = scale_node->src[1] == mm_node;
     if (!scale_lhs_mm && !scale_rhs_mm) {
@@ -2340,13 +2341,41 @@ static const ggml_tensor * ggml_cuda_get_mul_mat_scale(const ggml_tensor * scale
     }
 
     const ggml_tensor * scale = scale_lhs_mm ? scale_node->src[1] : scale_node->src[0];
-    if ((mm_node->src[0]->type != GGML_TYPE_NVFP4 && mm_node->src[0]->type != GGML_TYPE_F8_E4M3) || scale_node->type != GGML_TYPE_F32 ||
-            scale->type != GGML_TYPE_F32 || !ggml_is_contiguous(scale) || ggml_nelements(scale) != 1 ||
-            !ggml_are_same_shape(scale_node, mm_node)) {
+    if (scale_node->type != GGML_TYPE_F32 || scale->type != GGML_TYPE_F32 ||
+            !ggml_is_contiguous(scale) || !ggml_are_same_shape(scale_node, mm_node)) {
+        return nullptr;
+    }
+    const ggml_tensor * weight = mm_node->src[0];
+    if (weight->type == GGML_TYPE_NVFP4 || weight->type == GGML_TYPE_F8_E4M3) {
+        return ggml_nelements(scale) == 1 ? scale : nullptr;
+    }
+    if (!dst) {
         return nullptr;
     }
 
-    return scale;
+    // Row coefficients use the regular MMVQ dot product and are applied only at writeback.
+    const ggml_tensor * input = mm_node->src[1];
+    const int cc = ggml_cuda_info().devices[ggml_cuda_get_device()].cc;
+    if (!GGML_CUDA_CC_IS_NVIDIA(cc) ||
+            (weight->type != GGML_TYPE_Q5_K && weight->type != GGML_TYPE_Q6_K) ||
+            !ggml_cuda_should_fuse_mul_mat_vec_q(mm_node) ||
+            ggml_cuda_op_mul_mat_use_fwht(mm_node) ||
+            !ggml_is_matrix(weight) || !ggml_is_contiguous(weight) ||
+            !ggml_is_contiguous(input) || !ggml_is_contiguous(dst) ||
+            ggml_nrows(input) != 1 || ggml_nrows(dst) != 1 || dst->type != GGML_TYPE_F32 ||
+            !ggml_are_same_shape(dst, mm_node) ||
+            ggml_nrows(scale) != 1 || scale->ne[0] != dst->ne[0] ||
+            ggml_backend_buffer_get_usage(weight->buffer) != GGML_BACKEND_BUFFER_USAGE_WEIGHTS) {
+        return nullptr;
+    }
+
+    // The matvec reads its inputs across multiple blocks. Reject any overlap.
+    const auto overlaps_dst = [dst](const ggml_tensor * src) {
+        const auto src_addr = reinterpret_cast<uintptr_t>(src->data);
+        const auto dst_addr = reinterpret_cast<uintptr_t>(dst->data);
+        return src_addr < dst_addr + ggml_nbytes(dst) && dst_addr < src_addr + ggml_nbytes(src);
+    };
+    return overlaps_dst(weight) || overlaps_dst(input) || overlaps_dst(scale) ? nullptr : scale;
 }
 
 // The same for MUL_MAT_ID with one scale per expert: RESHAPE, REPEAT and GET_ROWS (by the ids) of the scales, then the MUL.
@@ -4328,6 +4357,17 @@ static bool ggml_cuda_can_fuse(const struct ggml_cgraph *                cgraph,
     return false;
 }
 
+#if !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA)
+// Equal contiguous inputs can be updated elementwise in place. Partial overlap
+// and broadcast inputs sharing the output storage would race across threads.
+static bool ggml_cuda_elementwise_input_is_safe(const ggml_tensor * src, const ggml_tensor * dst) {
+    const uintptr_t src_addr = (uintptr_t) src->data;
+    const uintptr_t dst_addr = (uintptr_t) dst->data;
+    return (src_addr == dst_addr && ggml_are_same_shape(src, dst)) ||
+           src_addr + ggml_nbytes(src) <= dst_addr || dst_addr + ggml_nbytes(dst) <= src_addr;
+}
+#endif
+
 // try and fuse nodes and return the number of nodes to skip
 static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph * cgraph, int i) {
 
@@ -4484,6 +4524,60 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
         return 2;
     }
 
+#if !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA)
+    // Dory attention gate: sigmoid(x * weight) * attention_output.
+    if (node->op == GGML_OP_MUL && ggml_can_fuse(cgraph, i, { GGML_OP_MUL, GGML_OP_UNARY, GGML_OP_MUL })) {
+        const ggml_tensor * sigmoid = cgraph->nodes[i + 1];
+        ggml_tensor * dst = cgraph->nodes[i + 2];
+        const ggml_tensor * x = node->src[0];
+        const ggml_tensor * weight = node->src[1];
+        const ggml_tensor * other = dst->src[0];
+        if (ggml_get_unary_op(sigmoid) == GGML_UNARY_OP_SIGMOID && dst->src[1] == sigmoid &&
+            x->type == GGML_TYPE_F32 && weight->type == GGML_TYPE_F32 && other->type == GGML_TYPE_F32 &&
+            ggml_are_same_shape(x, dst) && ggml_are_same_shape(other, dst) &&
+            ggml_nrows(weight) == 1 && weight->ne[0] == dst->ne[0] && ggml_nrows(dst) <= 65535 &&
+            ggml_is_contiguous(x) && ggml_is_contiguous(weight) && ggml_is_contiguous(other) &&
+            ggml_is_contiguous(dst) && ggml_cuda_elementwise_input_is_safe(x, dst) &&
+            ggml_cuda_elementwise_input_is_safe(weight, dst) && ggml_cuda_elementwise_input_is_safe(other, dst)) {
+            ggml_cuda_op_mul_sigmoid_mul(*cuda_ctx, x, weight, other, dst);
+            return 2;
+        }
+    }
+
+    // Dory residual update: a + (b - a) * alpha, with one coefficient per column.
+    if (node->op == GGML_OP_SUB && ggml_can_fuse(cgraph, i, { GGML_OP_SUB, GGML_OP_MUL, GGML_OP_ADD })) {
+        ggml_tensor * mul = cgraph->nodes[i + 1];
+        ggml_tensor * add = cgraph->nodes[i + 2];
+        const ggml_tensor * b = node->src[0];
+        const ggml_tensor * a = node->src[1];
+        const ggml_tensor * alpha = mul->src[1];
+
+        const bool with_norm = ggml_can_fuse(cgraph, i,
+            { GGML_OP_SUB, GGML_OP_MUL, GGML_OP_ADD, GGML_OP_RMS_NORM, GGML_OP_SCALE });
+        ggml_tensor * dst = with_norm ? cgraph->nodes[i + 4] : add;
+        float bias = 0.0f;
+        if (with_norm) {
+            memcpy(&bias, (const float *) dst->op_params + 1, sizeof(bias));
+        }
+
+        if (mul->src[0] == node && add->src[0] == a && add->src[1] == mul &&
+            a->type == GGML_TYPE_F32 && b->type == GGML_TYPE_F32 && alpha->type == GGML_TYPE_F32 &&
+            ggml_are_same_shape(a, add) && ggml_are_same_shape(b, add) &&
+            ggml_nrows(alpha) == 1 && alpha->ne[0] == add->ne[0] && ggml_nrows(add) <= 65535 &&
+            ggml_is_contiguous(a) && ggml_is_contiguous(b) && ggml_is_contiguous(alpha) &&
+            ggml_is_contiguous(add) && ggml_is_contiguous(dst) && dst->type == GGML_TYPE_F32 &&
+            bias == 0.0f && ggml_cuda_elementwise_input_is_safe(a, dst) &&
+            ggml_cuda_elementwise_input_is_safe(b, dst) && ggml_cuda_elementwise_input_is_safe(alpha, dst)) {
+            if (with_norm) {
+                ggml_cuda_op_residual_mix_norm(*cuda_ctx, a, b, alpha, cgraph->nodes[i + 3], dst);
+                return 4;
+            }
+            ggml_cuda_op_residual_mix(*cuda_ctx, a, b, alpha, add);
+            return 2;
+        }
+    }
+#endif
+
     // Snake activation: y = x + sin(a*x)^2 * inv_b
     // Naive 5-op decomposition emitted by frontends: mul -> sin -> sqr -> mul -> add
     if (ggml_can_fuse_subgraph(cgraph, i,
@@ -4636,8 +4730,9 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
                     continue;
                 }
 
-                const ggml_tensor * gate_scale = ggml_cuda_get_mul_mat_scale(gate_scale_n, gate_n);
-                const ggml_tensor * up_scale   = ggml_cuda_get_mul_mat_scale(up_scale_n, up_n);
+                const bool allow_row_scale = !with_bias && ggml_get_glu_op(glu) == GGML_GLU_OP_SWIGLU;
+                const ggml_tensor * gate_scale = ggml_cuda_get_mul_mat_scale(gate_scale_n, gate_n, allow_row_scale ? glu : nullptr);
+                const ggml_tensor * up_scale   = ggml_cuda_get_mul_mat_scale(up_scale_n, up_n, allow_row_scale ? glu : nullptr);
                 if (!gate_scale || !up_scale) {
                     continue;
                 }
@@ -4969,7 +5064,7 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
 
             const ggml_tensor * scale = nullptr;
             if (op == GGML_OP_MUL_MAT) {
-                scale = ggml_cuda_get_mul_mat_scale(scale_node, mm_node);
+                scale = ggml_cuda_get_mul_mat_scale(scale_node, mm_node, with_bias ? nullptr : out_node);
             } else {
                 scale = ggml_cuda_get_mul_mat_id_scale(cgraph->nodes[i + 1], cgraph->nodes[i + 2], cgraph->nodes[i + 3], scale_node, mm_node);
             }
@@ -5122,6 +5217,30 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
         ggml_cuda_op_rms_norm_fused(*cuda_ctx, node, cgraph->nodes[i + 1]);
         return 1;
     }
+
+#if !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA)
+    // Dory shares one coefficient vector per head across the tokens in a prompt.
+    if (node->op == GGML_OP_RMS_NORM && ggml_can_fuse_subgraph(cgraph, i,
+            { GGML_OP_RMS_NORM, GGML_OP_SCALE, GGML_OP_RESHAPE, GGML_OP_MUL }, { i + 3 })) {
+        const ggml_tensor * scale = cgraph->nodes[i + 1];
+        const ggml_tensor * weight = cgraph->nodes[i + 2];
+        ggml_tensor * dst = cgraph->nodes[i + 3];
+        const ggml_tensor * x = node->src[0];
+        float bias;
+        memcpy(&bias, (const float *) scale->op_params + 1, sizeof(bias));
+        if (bias == 0.0f && scale->src[0] == node && dst->src[0] == scale && dst->src[1] == weight &&
+            weight->src[0]->op == GGML_OP_NONE && x->type == GGML_TYPE_F32 &&
+            weight->type == GGML_TYPE_F32 && dst->type == GGML_TYPE_F32 &&
+            x->ne[0] > 0 && x->ne[0] < 1024 && x->ne[1] > 0 && x->ne[1] <= INT_MAX &&
+            x->ne[2] > 0 && x->ne[2] <= UINT16_MAX && x->ne[3] == 1 && ggml_is_matrix(weight) &&
+            weight->ne[0] == x->ne[0] && weight->ne[1] == x->ne[1] && ggml_are_same_shape(x, dst) &&
+            ggml_is_contiguous(x) && ggml_is_contiguous(weight) && ggml_is_contiguous(dst) &&
+            ggml_cuda_elementwise_input_is_safe(x, dst) && ggml_cuda_elementwise_input_is_safe(weight, dst)) {
+            ggml_cuda_op_rms_norm_scale_mul(*cuda_ctx, node, scale, weight, dst);
+            return 3;
+        }
+    }
+#endif
 
     if (ggml_cuda_can_fuse(cgraph, i, { GGML_OP_RMS_NORM, GGML_OP_SCALE }, {})) {
         ggml_cuda_op_rms_norm_scale_fused(*cuda_ctx, node, cgraph->nodes[i + 1]);

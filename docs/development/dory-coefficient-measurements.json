@@ -1,0 +1,250 @@
+{
+  "base_revision": "98a74c97ea09ac72f6ceda1559808fc0a2f447ce",
+  "model": "nvidia/NVIDIA-Nemotron-Labs-Dory1.0-4B-GGUF, Q5_K_M",
+  "model_sha256": "96080be49ffd67b916018b7bdef8c484762576fb52780e10ab98ac4978a660e0",
+  "hardware": "NVIDIA RTX 2060 6 GB, Windows x64, CUDA sm_75",
+  "settings": {
+    "loops": 2,
+    "context": 8192,
+    "gpu_layers": 99,
+    "batch_size": 256,
+    "ubatch_size": 128,
+    "threads": 5,
+    "threads_batch": 5,
+    "cache_type_k": "q8_0",
+    "cache_type_v": "f16",
+    "kv_cache_mode": "last_loop",
+    "flash_attention": false,
+    "cuda_graphs": true,
+    "generated_tokens": 128,
+    "temperature": 0,
+    "seed": 42,
+    "ignore_eos": true,
+    "cache_prompt": false,
+    "warmup_tokens": 32
+  },
+  "experiments": [
+    {
+      "name": "stock_vs_shared_nodes",
+      "order": [
+        "stock",
+        "shared_nodes",
+        "shared_nodes",
+        "stock"
+      ],
+      "results": [
+        {
+          "run": 0,
+          "build": "stock",
+          "prompt_tokens": 17,
+          "prompt_ms": 634.537,
+          "generated_tokens": 128,
+          "generated_ms": 9747.196,
+          "tokens_per_second": 13.029388144036501,
+          "response_sha256": "d8605bf39fe7927d3d002eb34015a650dc741b3b83796c0939bb73fbe6d2f958"
+        },
+        {
+          "run": 0,
+          "build": "stock",
+          "prompt_tokens": 641,
+          "prompt_ms": 2146.1,
+          "generated_tokens": 128,
+          "generated_ms": 9470.127,
+          "tokens_per_second": 13.410591008969574,
+          "response_sha256": "5a67321cfde4f1bf40d0a0a93bfab3b2091b314af94aca2ba483928d551099d8"
+        },
+        {
+          "run": 1,
+          "build": "shared_nodes",
+          "prompt_tokens": 17,
+          "prompt_ms": 572.594,
+          "generated_tokens": 128,
+          "generated_ms": 7665.22,
+          "tokens_per_second": 16.568343765736664,
+          "response_sha256": "d8605bf39fe7927d3d002eb34015a650dc741b3b83796c0939bb73fbe6d2f958"
+        },
+        {
+          "run": 1,
+          "build": "shared_nodes",
+          "prompt_tokens": 641,
+          "prompt_ms": 2032.786,
+          "generated_tokens": 128,
+          "generated_ms": 9097.529,
+          "tokens_per_second": 13.959834588051327,
+          "response_sha256": "5a67321cfde4f1bf40d0a0a93bfab3b2091b314af94aca2ba483928d551099d8"
+        },
+        {
+          "run": 2,
+          "build": "shared_nodes",
+          "prompt_tokens": 17,
+          "prompt_ms": 591.643,
+          "generated_tokens": 128,
+          "generated_ms": 7717.609,
+          "tokens_per_second": 16.455873833463187,
+          "response_sha256": "d8605bf39fe7927d3d002eb34015a650dc741b3b83796c0939bb73fbe6d2f958"
+        },
+        {
+          "run": 2,
+          "build": "shared_nodes",
+          "prompt_tokens": 641,
+          "prompt_ms": 2023.452,
+          "generated_tokens": 128,
+          "generated_ms": 9074.5,
+          "tokens_per_second": 13.995261446911675,
+          "response_sha256": "5a67321cfde4f1bf40d0a0a93bfab3b2091b314af94aca2ba483928d551099d8"
+        },
+        {
+          "run": 3,
+          "build": "stock",
+          "prompt_tokens": 17,
+          "prompt_ms": 677.352,
+          "generated_tokens": 128,
+          "generated_ms": 9827.613,
+          "tokens_per_second": 12.922771785987097,
+          "response_sha256": "d8605bf39fe7927d3d002eb34015a650dc741b3b83796c0939bb73fbe6d2f958"
+        },
+        {
+          "run": 3,
+          "build": "stock",
+          "prompt_tokens": 641,
+          "prompt_ms": 2265.778,
+          "generated_tokens": 128,
+          "generated_ms": 9967.246,
+          "tokens_per_second": 12.741734276449083,
+          "response_sha256": "5a67321cfde4f1bf40d0a0a93bfab3b2091b314af94aca2ba483928d551099d8"
+        }
+      ]
+    },
+    {
+      "name": "shared_nodes_vs_precomputed",
+      "order": [
+        "shared_nodes",
+        "precomputed",
+        "precomputed",
+        "shared_nodes"
+      ],
+      "results": [
+        {
+          "run": 0,
+          "build": "shared_nodes",
+          "prompt_tokens": 17,
+          "prompt_ms": 601.148,
+          "generated_tokens": 128,
+          "generated_ms": 9446.535,
+          "tokens_per_second": 13.444082936230057,
+          "response_sha256": "d8605bf39fe7927d3d002eb34015a650dc741b3b83796c0939bb73fbe6d2f958"
+        },
+        {
+          "run": 0,
+          "build": "shared_nodes",
+          "prompt_tokens": 641,
+          "prompt_ms": 1998.701,
+          "generated_tokens": 128,
+          "generated_ms": 8598.587,
+          "tokens_per_second": 14.769868584222037,
+          "response_sha256": "5a67321cfde4f1bf40d0a0a93bfab3b2091b314af94aca2ba483928d551099d8"
+        },
+        {
+          "run": 0,
+          "build": "shared_nodes",
+          "prompt_tokens": 2111,
+          "prompt_ms": 5693.164,
+          "generated_tokens": 128,
+          "generated_ms": 8543.375,
+          "tokens_per_second": 14.86531961900303,
+          "response_sha256": "cabbfbffa996073fd6783d559d255df1b61c5b4a211058c632309e336c253b78"
+        },
+        {
+          "run": 1,
+          "build": "precomputed",
+          "prompt_tokens": 17,
+          "prompt_ms": 600.431,
+          "generated_tokens": 128,
+          "generated_ms": 5656.578,
+          "tokens_per_second": 22.451736721388798,
+          "response_sha256": "d8605bf39fe7927d3d002eb34015a650dc741b3b83796c0939bb73fbe6d2f958"
+        },
+        {
+          "run": 1,
+          "build": "precomputed",
+          "prompt_tokens": 641,
+          "prompt_ms": 1926.497,
+          "generated_tokens": 128,
+          "generated_ms": 6084.324,
+          "tokens_per_second": 20.873313124021667,
+          "response_sha256": "5a67321cfde4f1bf40d0a0a93bfab3b2091b314af94aca2ba483928d551099d8"
+        },
+        {
+          "run": 1,
+          "build": "precomputed",
+          "prompt_tokens": 2111,
+          "prompt_ms": 5441.088,
+          "generated_tokens": 128,
+          "generated_ms": 6439.118,
+          "tokens_per_second": 19.723198115021344,
+          "response_sha256": "cabbfbffa996073fd6783d559d255df1b61c5b4a211058c632309e336c253b78"
+        },
+        {
+          "run": 2,
+          "build": "precomputed",
+          "prompt_tokens": 17,
+          "prompt_ms": 529.1,
+          "generated_tokens": 128,
+          "generated_ms": 5651.082,
+          "tokens_per_second": 22.473572317655275,
+          "response_sha256": "d8605bf39fe7927d3d002eb34015a650dc741b3b83796c0939bb73fbe6d2f958"
+        },
+        {
+          "run": 2,
+          "build": "precomputed",
+          "prompt_tokens": 641,
+          "prompt_ms": 1981.524,
+          "generated_tokens": 128,
+          "generated_ms": 5739.123,
+          "tokens_per_second": 22.12881654566386,
+          "response_sha256": "5a67321cfde4f1bf40d0a0a93bfab3b2091b314af94aca2ba483928d551099d8"
+        },
+        {
+          "run": 2,
+          "build": "precomputed",
+          "prompt_tokens": 2111,
+          "prompt_ms": 5418.626,
+          "generated_tokens": 128,
+          "generated_ms": 6138.414,
+          "tokens_per_second": 20.689383283695104,
+          "response_sha256": "cabbfbffa996073fd6783d559d255df1b61c5b4a211058c632309e336c253b78"
+        },
+        {
+          "run": 3,
+          "build": "shared_nodes",
+          "prompt_tokens": 17,
+          "prompt_ms": 558.321,
+          "generated_tokens": 128,
+          "generated_ms": 7244.838,
+          "tokens_per_second": 17.52972254176008,
+          "response_sha256": "d8605bf39fe7927d3d002eb34015a650dc741b3b83796c0939bb73fbe6d2f958"
+        },
+        {
+          "run": 3,
+          "build": "shared_nodes",
+          "prompt_tokens": 641,
+          "prompt_ms": 2003.015,
+          "generated_tokens": 128,
+          "generated_ms": 8193.36,
+          "tokens_per_second": 15.50035638614683,
+          "response_sha256": "5a67321cfde4f1bf40d0a0a93bfab3b2091b314af94aca2ba483928d551099d8"
+        },
+        {
+          "run": 3,
+          "build": "shared_nodes",
+          "prompt_tokens": 2111,
+          "prompt_ms": 5400.093,
+          "generated_tokens": 128,
+          "generated_ms": 7827.827,
+          "tokens_per_second": 16.22417051373261,
+          "response_sha256": "cabbfbffa996073fd6783d559d255df1b61c5b4a211058c632309e336c253b78"
+        }
+      ]
+    }
+  ]
+}

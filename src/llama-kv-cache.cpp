@@ -1737,6 +1737,27 @@ static void set_input_attn_mask_impl(const args_set_input_attn_mask & args, T * 
     const T mask_keep = llama_cast<T>(0.0f);
     const T mask_drop = llama_cast<T>(-INFINITY);
 
+    if constexpr (causal && !is_2d && !alibi) {
+        if (ubatch->n_tokens == 1 && n_stream == 1 && n_tps == 1 && !rows_all) {
+            // A decode step has no second mask row to reuse. Avoid building
+            // per-sequence maps and tracking cells for a future row.
+            const llama_seq_id seq_id = ubatch->seq_id[0][0];
+            const auto & cells = v_cells.at(seq_to_stream[seq_id]);
+            const llama_pos pos = ubatch->pos[0];
+            for (uint32_t j = 0; j < n_kv; ++j) {
+                T value = mask_drop;
+                if (!cells.is_empty(j) && cells.seq_has(j, seq_id)) {
+                    const llama_pos cached_pos = cells.pos_get(j);
+                    if (cached_pos <= pos && (!swa || !llama_hparams::is_masked_swa(n_swa, swa_type, cached_pos, pos))) {
+                        value = mask_keep;
+                    }
+                }
+                data[j] = value;
+            }
+            return;
+        }
+    }
+
     // the min position in the batch for each sequence
     llama_pos seq_pos_min[LLAMA_MAX_SEQ];
     std::fill(seq_pos_min, seq_pos_min + LLAMA_MAX_SEQ, INT32_MAX);

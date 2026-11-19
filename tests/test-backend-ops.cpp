@@ -4081,6 +4081,99 @@ struct test_rms_norm_back : public test_case {
 };
 
 // GGML_OP_RMS_NORM + GGML_OP_MUL + GGML_OP_ADD (+ GGML_OP_MUL)
+struct test_dory_query_norm : public test_case {
+    const int64_t tokens;
+    const float bias;
+    const int64_t head_dim;
+
+    test_dory_query_norm(int64_t tokens, float bias, int64_t head_dim = 128)
+        : tokens(tokens), bias(bias), head_dim(head_dim) {}
+
+    std::string op_desc(ggml_tensor *) override { return "DORY_QUERY_NORM"; }
+    std::string vars() override { return VARS_TO_STR3(tokens, bias, head_dim); }
+    bool run_whole_graph() override { return true; }
+    bool use_weight_context() override { return true; }
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        GGML_UNUSED(ctx);
+        GGML_ABORT("query normalization requires a weight context");
+    }
+
+    ggml_tensor * build_graph(ggml_context * ctx, ggml_context * ctx_weights) override {
+        constexpr int64_t heads = 32;
+        auto * q = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, head_dim, heads, tokens);
+        auto * weight = ggml_new_tensor_1d(ctx_weights, GGML_TYPE_F32, head_dim * heads);
+        q = ggml_rms_norm(ctx, q, 1e-6f / head_dim);
+        q = ggml_scale_bias(ctx, q, 1.0f / sqrtf(head_dim), bias);
+        return ggml_mul(ctx, q, ggml_reshape_3d(ctx, weight, head_dim, heads, 1));
+    }
+};
+
+// Exercise the complete Dory CUDA fusion patterns and their fallback paths.
+struct test_dory_cuda_fusion : public test_case {
+    const bool gate;
+    const std::array<int64_t, 4> ne;
+    const std::string layout;
+
+    test_dory_cuda_fusion(bool gate, std::array<int64_t, 4> ne, std::string layout)
+        : gate(gate), ne(ne), layout(layout) {}
+
+    std::string op_desc(ggml_tensor *) override {
+        return gate ? "DORY_ATTENTION_GATE" : "DORY_RESIDUAL_MIX_NORM";
+    }
+    std::string vars() override { return VARS_TO_STR3(gate, ne, layout); }
+    bool run_whole_graph() override { return true; }
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        ggml_tensor * a = ggml_new_tensor(ctx, GGML_TYPE_F32, 4, ne.data());
+        if (layout == "strided") {
+            ggml_tensor * base = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, ne[0] + 7, ne[1], ne[2], ne[3]);
+            a = ggml_view_4d(ctx, base, ne[0], ne[1], ne[2], ne[3],
+                             base->nb[1], base->nb[2], base->nb[3], 0);
+        }
+        ggml_tensor * b = ggml_new_tensor(ctx, GGML_TYPE_F32, 4, ne.data());
+        ggml_tensor * weight = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, layout == "scalar" ? 1 : ne[0]);
+        if (layout == "alias_weight") {
+            weight = ggml_view_1d(ctx, a, ne[0], 0);
+        }
+        // Materialize all inputs before the chain, as happens after Dory's matrix products.
+        b = ggml_add(ctx, b, weight);
+        if (layout != "alias_weight" && layout != "strided") {
+            a = ggml_scale(ctx, a, 1.0f);
+        }
+        ggml_tensor * intermediate;
+        ggml_tensor * mix;
+        if (gate) {
+            intermediate = ggml_mul(ctx, a, weight);
+            ggml_tensor * sigmoid = ggml_sigmoid(ctx, intermediate);
+            if (layout == "alias_weight") {
+                mix = ggml_mul_inplace(ctx, a, sigmoid);
+            } else {
+                mix = layout == "inplace" ? ggml_mul_inplace(ctx, b, sigmoid) : ggml_mul(ctx, b, sigmoid);
+            }
+        } else {
+            intermediate = ggml_sub(ctx, b, a);
+            ggml_tensor * weighted = ggml_mul(ctx, intermediate, weight);
+            mix = layout == "alias_weight" ? ggml_add_inplace(ctx, a, weighted) : ggml_add(ctx, a, weighted);
+        }
+        ggml_tensor * out = mix;
+        if (!gate && layout != "no_norm") {
+            out = ggml_rms_norm(ctx, mix, 1e-6f / ne[0]);
+            const float scale = 1.0f / sqrtf(ne[0]);
+            const float bias = layout == "bias" ? 0.25f : 0.0f;
+            out = layout == "inplace" ? ggml_scale_bias_inplace(ctx, out, scale, bias)
+                                      : ggml_scale_bias(ctx, out, scale, bias);
+        }
+        if (layout == "reuse") {
+            out = ggml_add(ctx, out, intermediate);
+        } else if (layout == "reuse_mix") {
+            out = ggml_add(ctx, out, mix);
+        }
+        ggml_set_name(out, "out");
+        return out;
+    }
+};
+
 struct test_rms_norm_mul_add : public test_case {
     const ggml_type type;
     const std::array<int64_t, 4> ne;
@@ -8154,7 +8247,10 @@ struct test_mul_mat_fusion : public test_case {
     }
 
     bool run_whole_graph() override { return true; }
-    bool use_weight_context() override { return use_id && with_lane_scale; }
+    bool row_scale() const {
+        return !use_id && with_lane_scale && (type == GGML_TYPE_Q5_K || type == GGML_TYPE_Q6_K);
+    }
+    bool use_weight_context() override { return with_lane_scale && (use_id || row_scale()); }
 
     ggml_tensor * build_gate(ggml_context * ctx, ggml_tensor * ffn_gate, ggml_tensor * ffn_up) {
         ggml_tensor * out = nullptr;
@@ -8173,8 +8269,9 @@ struct test_mul_mat_fusion : public test_case {
         return out;
     }
 
-    ggml_tensor * build_lane_scale_dense(ggml_context * ctx, ggml_tensor * out) {
-        ggml_tensor * scale = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, 1);
+    ggml_tensor * build_lane_scale_dense(ggml_context * ctx, ggml_context * ctx_weights, ggml_tensor * out) {
+        ggml_tensor * scale = row_scale() ? ggml_new_tensor_1d(ctx_weights, GGML_TYPE_F32, out->ne[0])
+                                         : ggml_new_tensor_1d(ctx, GGML_TYPE_F32, 1);
         return ggml_mul(ctx, out, scale);
     }
 
@@ -8200,13 +8297,14 @@ struct test_mul_mat_fusion : public test_case {
             std::array<int64_t, 4> ne0      = { k, n, channels, samples };
 
             ggml_tensor * cur  = ggml_new_tensor(ctx, GGML_TYPE_F32, 4, ne.data());
-            ggml_tensor * gate = with_gate ? ggml_new_tensor(ctx, type, 4, ne0.data()) : nullptr;
-            ggml_tensor * up   = ggml_new_tensor(ctx, type, 4, ne0.data());
+            ggml_context * weight_ctx = row_scale() ? ctx_weights : ctx;
+            ggml_tensor * gate = with_gate ? ggml_new_tensor(weight_ctx, type, 4, ne0.data()) : nullptr;
+            ggml_tensor * up   = ggml_new_tensor(weight_ctx, type, 4, ne0.data());
 
             auto build_lane_up = [&]() {
                 ggml_tensor * ffn_up = ggml_mul_mat(ctx, up, cur);
                 if (with_lane_scale) {
-                    ffn_up = build_lane_scale_dense(ctx, ffn_up);
+                    ffn_up = build_lane_scale_dense(ctx, ctx_weights, ffn_up);
                 }
                 if (with_bias) {
                     std::array<int64_t, 4> bias_ne = { ffn_up->ne[0], 1, channels, samples };
@@ -8219,7 +8317,7 @@ struct test_mul_mat_fusion : public test_case {
             auto build_lane_gate = [&]() {
                 ggml_tensor * ffn_gate = ggml_mul_mat(ctx, gate, cur);
                 if (with_lane_scale) {
-                    ffn_gate = build_lane_scale_dense(ctx, ffn_gate);
+                    ffn_gate = build_lane_scale_dense(ctx, ctx_weights, ffn_gate);
                 }
                 if (with_bias) {
                     std::array<int64_t, 4> bias_ne   = { ffn_gate->ne[0], 1, channels, samples };
@@ -11472,6 +11570,29 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     }
     test_cases.emplace_back(new test_bin_bcast(ggml_add, GGML_TYPE_F32, {2, 2, 2, 2}, {17, 1, 1, 1}, 1, false, false, GGML_TYPE_COUNT, true));
 
+    test_cases.emplace_back(new test_dory_query_norm(1, 0.0f));
+    test_cases.emplace_back(new test_dory_query_norm(1, 0.25f)); // nonzero scale bias keeps the separate ops
+    test_cases.emplace_back(new test_dory_query_norm(7, 0.0f));
+    test_cases.emplace_back(new test_dory_query_norm(7, 0.0f, 513));
+    test_cases.emplace_back(new test_dory_query_norm(7, 0.25f));
+
+    test_cases.emplace_back(new test_dory_cuda_fusion(false, { 4096, 3, 1, 1 }, "contiguous"));
+    test_cases.emplace_back(new test_dory_cuda_fusion(false, { 4097, 3, 1, 1 }, "contiguous"));
+
+    // Decode and prompt batches, both normalization block sizes, and odd widths.
+    for (int64_t width : { 128, 513, 1024, 2560 }) {
+        for (int64_t tokens : { 1, 7 }) {
+            for (bool gate : { false, true }) {
+                test_cases.emplace_back(new test_dory_cuda_fusion(gate, { width, tokens, 1, 1 }, "contiguous"));
+            }
+        }
+    }
+    for (const char * layout : { "strided", "inplace", "reuse", "reuse_mix", "scalar", "bias", "no_norm", "alias_weight" }) {
+        for (bool gate : { false, true }) {
+            test_cases.emplace_back(new test_dory_cuda_fusion(gate, { 2560, 3, 2, 1 }, layout));
+        }
+    }
+
     // single inplace tests, especially important for WebGPU backend since kernels for inplace vs. not are different
     test_cases.emplace_back(new test_bin_bcast(ggml_add_inplace, GGML_TYPE_F32, {16, 5, 4, 3}, {1, 1, 1, 1}, 16));
     test_cases.emplace_back(new test_bin_bcast(ggml_mul_inplace, GGML_TYPE_F32, {16, 5, 4, 3}, {1, 1, 1, 1}, 16));
@@ -13203,6 +13324,16 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
             for (int64_t m_batch : {1, 2, 3, 5, 8, 9, 16, 17}) {
                 test_cases.emplace_back(new test_mul_mat_fusion(type, glu_op, m_batch, 1000, 1024,
                     false, 16, 8, false, false, true, false, { 1, 1 }));
+            }
+        }
+    }
+
+    // Dory's single-token row scales, with and without the paired SwiGLU projection.
+    for (ggml_type type : {GGML_TYPE_Q5_K, GGML_TYPE_Q6_K}) {
+        for (bool with_gate : {false, true}) {
+            for (int64_t m_batch : {1, 2}) {
+                test_cases.emplace_back(new test_mul_mat_fusion(type, GGML_GLU_OP_SWIGLU, m_batch, 7168, 2560,
+                    false, 1, 1, false, false, with_gate, true, {1, 1}));
             }
         }
     }

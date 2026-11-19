@@ -835,13 +835,29 @@ static __global__ void mul_mat_vec_q(
                     if constexpr (type == GGML_TYPE_NVFP4) {
                         result *= x_scales;
                     }
-                    result += x_biases[j];
+                    if constexpr (type == GGML_TYPE_Q5_K || type == GGML_TYPE_Q6_K) {
+                        if (fusion.x_scale) {
+                            result *= static_cast<const float *>(fusion.x_scale)[row0 + i];
+                        } else {
+                            result += x_biases[j];
+                        }
+                    } else {
+                        result += x_biases[j];
+                    }
                     if (use_gate) {
                         float gate_value = tmp_gate[j][i];
                         if constexpr (type == GGML_TYPE_NVFP4) {
                             gate_value *= gate_scales;
                         }
-                        gate_value += gate_biases[j];
+                        if constexpr (type == GGML_TYPE_Q5_K || type == GGML_TYPE_Q6_K) {
+                            if (fusion.gate_scale) {
+                                gate_value *= static_cast<const float *>(fusion.gate_scale)[row0 + i];
+                            } else {
+                                gate_value += gate_biases[j];
+                            }
+                        } else {
+                            gate_value += gate_biases[j];
+                        }
                         switch (active_glu) {
                             case GGML_GLU_OP_SWIGLU:
                                 result *= ggml_cuda_op_silu_single(gate_value);
@@ -1485,9 +1501,12 @@ void ggml_cuda_mul_mat_vec_q(
         const int cc = ggml_cuda_info().devices[ggml_cuda_get_device()].cc;
         GGML_ASSERT( !ids || dst->ne[2] <= get_mmvq_mmid_max_batch(src0->type, cc));
         GGML_ASSERT(  ids || dst->ne[1] == 1);
-        // Scale fusion is only allowed for NVFP4 currently as the cost of checking this at run-time in the prologue is
-        // non-negligible for some models such as gpt-oss-20b
-        GGML_ASSERT((fusion->x_scale == nullptr && fusion->gate_scale == nullptr) || src0->type == GGML_TYPE_NVFP4);
+        const bool has_scale = fusion->x_scale || fusion->gate_scale;
+        const bool row_scale = has_scale && (src0->type == GGML_TYPE_Q5_K || src0->type == GGML_TYPE_Q6_K);
+        GGML_ASSERT(!has_scale || src0->type == GGML_TYPE_NVFP4 || row_scale);
+        GGML_ASSERT(!row_scale || (!ids && ggml_nrows(dst) == 1 && !fusion->x_bias && !fusion->gate_bias &&
+                    fusion->x_scale && (!fusion->gate || fusion->gate_scale)));
+        const int64_t scale_count = row_scale ? ne0 : (ids ? ne02 : 1);
 
         if (fusion->shared_up) {
             GGML_ASSERT(ids && fusion->gate && fusion->shared_gate && fusion->shared_dst);
@@ -1525,13 +1544,13 @@ void ggml_cuda_mul_mat_vec_q(
         if (fusion->x_scale) {
             GGML_ASSERT(fusion->x_scale->type == GGML_TYPE_F32);
             GGML_ASSERT(ggml_is_contiguous(fusion->x_scale));
-            GGML_ASSERT(ggml_nelements(fusion->x_scale) == (ids ? src0->ne[2] : 1));
+            GGML_ASSERT(ggml_nelements(fusion->x_scale) == scale_count);
             fusion_local.x_scale = fusion->x_scale->data;
         }
         if (fusion->gate_scale) {
             GGML_ASSERT(fusion->gate_scale->type == GGML_TYPE_F32);
             GGML_ASSERT(ggml_is_contiguous(fusion->gate_scale));
-            GGML_ASSERT(ggml_nelements(fusion->gate_scale) == (ids ? src0->ne[2] : 1));
+            GGML_ASSERT(ggml_nelements(fusion->gate_scale) == scale_count);
             fusion_local.gate_scale = fusion->gate_scale->data;
         }
         fusion_local.glu_op = fusion->glu_op;

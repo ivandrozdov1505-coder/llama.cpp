@@ -1,6 +1,73 @@
 #include "models.h"
 
 #include <stdexcept>
+#include "ggml-alloc.h"
+
+// Own immutable, precomputed model coefficients for the lifetime of this graph.
+// Keeping these outside the compute graph avoids repeating casts and scalar
+// arithmetic for every decoded token, including every recurrent-layer visit.
+class dory_frozen_scales final : public llm_graph_input_i {
+public:
+    explicit dory_frozen_scales(ggml_context * compute_ctx) : compute_ctx(compute_ctx) {}
+    ggml_context * compute_ctx;
+    std::map<const ggml_tensor *, ggml_tensor *> baked;
+    std::vector<ggml_context *> contexts;
+    std::vector<ggml_backend_buffer_t> buffers;
+
+    ~dory_frozen_scales() override {
+        for (auto * buffer : buffers) ggml_backend_buffer_free(buffer);
+        for (auto * ctx : contexts) ggml_free(ctx);
+    }
+    void set_input(const llama_ubatch *) override {}
+    bool can_reuse(const llm_graph_params &) override { return true; }
+
+    ggml_tensor * get(ggml_tensor * source, float factor, int transform = 0, ggml_backend_buffer_t placement = nullptr) {
+        const auto found = baked.find(source);
+        if (found != baked.end()) return found->second;
+        // The memory-fit pass builds a graph using unallocated placeholder weights.
+        // Keep the ordinary graph for this dry run; bake only loaded weights.
+        if (!source->data) {
+            auto * tensor = source->type == GGML_TYPE_F32 ? source : ggml_cast(compute_ctx, source, GGML_TYPE_F32);
+            tensor = ggml_scale(compute_ctx, tensor, factor);
+            if (transform == 1) tensor = ggml_sqr(compute_ctx, tensor);
+            if (transform == 2) tensor = ggml_abs(compute_ctx, tensor);
+            baked[source] = tensor;
+            return tensor;
+        }
+        GGML_ASSERT(ggml_is_contiguous(source) && source->buffer);
+        const auto count = ggml_nelements(source);
+        std::vector<uint8_t> raw(ggml_nbytes(source));
+        std::vector<float> values(count);
+        ggml_backend_tensor_get(source, raw.data(), 0, raw.size());
+        if (source->type == GGML_TYPE_F32) {
+            memcpy(values.data(), raw.data(), raw.size());
+        } else {
+            auto * traits = ggml_get_type_traits(source->type);
+            GGML_ASSERT(traits->to_float);
+            traits->to_float(raw.data(), values.data(), count);
+        }
+        for (auto & value : values) {
+            value *= factor;
+            if (transform == 1) value *= value;
+            if (transform == 2) value = fabsf(value);
+        }
+        auto * ctx = ggml_init({ggml_tensor_overhead() + 1024, nullptr, true});
+        if (!ctx) throw std::runtime_error("Dory: cannot allocate coefficient metadata");
+        contexts.push_back(ctx);
+        auto * tensor = ggml_new_tensor(ctx, GGML_TYPE_F32, GGML_MAX_DIMS, source->ne);
+        ggml_format_name(tensor, "dory.frozen.%s", source->name);
+        // BF16 vectors can be hosted on CPU because a backend lacks BF16 MUL.
+        // Their F32 copies belong alongside the layer's matrix, so the scheduler
+        // keeps elementwise operations on that layer's device.
+        auto * buffer = ggml_backend_alloc_ctx_tensors_from_buft(ctx, ggml_backend_buffer_get_type(placement ? placement : source->buffer));
+        if (!buffer) throw std::runtime_error("Dory: cannot allocate coefficients");
+        buffers.push_back(buffer);
+        ggml_backend_buffer_set_usage(buffer, GGML_BACKEND_BUFFER_USAGE_WEIGHTS);
+        ggml_backend_tensor_set(tensor, values.data(), 0, values.size() * sizeof(float));
+        baked[source] = tensor;
+        return tensor;
+    }
+};
 
 void llama_model_dory::load_arch_hparams(llama_model_loader & ml) {
     ml.get_key(LLM_KV_INPUT_LAYER_COUNT, n_input);
@@ -125,17 +192,38 @@ std::unique_ptr<llm_graph_context> llama_model_dory::build_arch_graph(const llm_
 llama_model_dory::graph::graph(const llama_model_dory & model, const llm_graph_params & params) : llm_graph_context(params) {
     ggml_tensor * cur = build_inp_embd(model.tok_embd);
     ggml_tensor * pos = build_inp_pos();
-    ggml_tensor * out_ids = build_inp_out_ids();
+    // A single requested token is already in output order. Keep the gather
+    // for pipeline graphs and batches that may select a subset of rows.
+    ggml_tensor * out_ids = n_tokens == 1 && n_outputs == 1 && !cparams.pipeline_parallel
+        ? nullptr : build_inp_out_ids();
     auto * attn = build_attn_inp_kv_iswa();
     ggml_tensor * input_h = nullptr;
     const int recurrent_end = model.n_input + model.n_recurrent * model.n_loops;
     const auto norm = [&](ggml_tensor * x) { return build_gdn_l2_norm(ctx0, x, 1e-6f); };
-    const auto f32 = [&](ggml_tensor * x) { return x->type == GGML_TYPE_F32 ? x : ggml_cast(ctx0, x, GGML_TYPE_F32); };
+    auto frozen_ptr = std::make_unique<dory_frozen_scales>(ctx0);
+    auto * frozen = frozen_ptr.get();
+    res->add_input(std::move(frozen_ptr));
+    // Weight-derived scales do not depend on tokens or recurrent-loop state.
+    // Reuse their graph nodes when a physical layer is visited again.
+    struct cached_scales { ggml_tensor * alpha = nullptr; ggml_tensor * g = nullptr; ggml_tensor * u = nullptr; ggml_tensor * q = nullptr; ggml_tensor * gate = nullptr; };
+    std::vector<cached_scales> scales(model.pattern.size());
 
     for (int il = 0; il < n_layer; ++il) {
         const int p = model.physical[il];
         const auto & l = model.layers[il];
         const auto & s = model.scale[il];
+        auto & cs = scales[p];
+        if (!cs.alpha) {
+            auto * placement = (model.pattern[p] == '-' ? l.ffn_down : l.wo)->buffer;
+            cs.alpha = frozen->get(s.alpha, model.alpha_init / model.init_std, 2, placement);
+            if (model.pattern[p] == '-') {
+                cs.g = frozen->get(s.suv_gate, sqrtf(n_embd), 0, placement);
+                cs.u = frozen->get(s.suv_up, sqrtf(n_embd), 0, placement);
+            } else {
+                cs.q = frozen->get(s.sqk, sqrtf(hparams.n_embd_head_k(il)) / model.init_std, 1, placement);
+                cs.gate = frozen->get(s.gate, sqrtf(model.gate_init) / model.init_std, 1, placement);
+            }
+        }
         if (il == (int) model.n_input) {
             input_h = cur;
         }
@@ -146,9 +234,10 @@ llama_model_dory::graph::graph(const llama_model_dory & model, const llm_graph_p
         if (model.pattern[p] == '-') {
             auto * g = build_lora_mm(l.ffn_gate, cur);
             auto * u = build_lora_mm(l.ffn_up, cur);
-            g = ggml_mul(ctx0, g, ggml_scale(ctx0, f32(s.suv_gate), sqrtf(n_embd)));
-            u = ggml_mul(ctx0, u, ggml_scale(ctx0, f32(s.suv_up), sqrtf(n_embd)));
-            cur = norm(ggml_mul(ctx0, ggml_silu(ctx0, g), u));
+            g = ggml_mul(ctx0, g, cs.g);
+            u = ggml_mul(ctx0, u, cs.u);
+            // One fused activation/gating kernel instead of writing the SiLU intermediate.
+            cur = norm(ggml_swiglu_split(ctx0, g, u));
             cur = build_lora_mm(l.ffn_down, cur);
         } else {
             const auto hd = hparams.n_embd_head_k(il);
@@ -160,11 +249,11 @@ llama_model_dory::graph::graph(const llama_model_dory & model, const llm_graph_p
                 q = ggml_rope_ext(ctx0, q, pos, nullptr, hd, rope_type, n_ctx_orig, theta, 1.0f, 0.0f, 1.0f, 0.0f, 0.0f);
                 k = ggml_rope_ext(ctx0, k, pos, nullptr, hd, rope_type, n_ctx_orig, theta, 1.0f, 0.0f, 1.0f, 0.0f, 0.0f);
             }
-            auto * sq = ggml_sqr(ctx0, ggml_scale(ctx0, f32(s.sqk), sqrtf(hd) / model.init_std));
+            auto * sq = cs.q;
             q = ggml_mul(ctx0, norm(q), ggml_reshape_3d(ctx0, sq, hd, nh, 1));
             k = norm(k);
             auto * gate = build_lora_mm(l.wqkv_gate, cur);
-            auto * sg = ggml_sqr(ctx0, ggml_scale(ctx0, f32(s.gate), sqrtf(model.gate_init) / model.init_std));
+            auto * sg = cs.gate;
             gate = ggml_sigmoid(ctx0, ggml_mul(ctx0, gate, sg));
             // Repeated writes replace only the current chunk; older tokens retain final-loop KV.
             cur = build_attn(attn, nullptr, nullptr, nullptr, q, k, v, nullptr, nullptr, nullptr, 1.0f / sqrtf(hd), model.cache_layer[il]);
@@ -173,7 +262,7 @@ llama_model_dory::graph::graph(const llama_model_dory & model, const llm_graph_p
         }
         auto * a = norm(residual);
         auto * b = norm(cur);
-        auto * alpha = ggml_abs(ctx0, ggml_scale(ctx0, f32(s.alpha), model.alpha_init / model.init_std));
+        auto * alpha = cs.alpha;
         cur = norm(ggml_add(ctx0, a, ggml_mul(ctx0, ggml_sub(ctx0, b, a), alpha)));
         if (il >= (int) model.n_input && il < recurrent_end && (il + 1 - model.n_input) % model.n_recurrent == 0) {
             cur = norm(cur);
@@ -186,7 +275,7 @@ llama_model_dory::graph::graph(const llama_model_dory & model, const llm_graph_p
     res->t_embd = cur;
     cb(cur, "result_norm", -1);
     cur = build_lora_mm(model.output, cur);
-    cur = ggml_mul(ctx0, cur, ggml_scale(ctx0, f32(model.logit_scale), 1.0f / model.init_std));
+    cur = ggml_mul(ctx0, cur, frozen->get(model.logit_scale, 1.0f / model.init_std, 0, model.output->buffer));
     cb(cur, "result_output", -1);
     res->t_logits = cur;
     ggml_build_forward_expand(gf, cur);
