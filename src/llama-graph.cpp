@@ -21,6 +21,7 @@
 #include <cmath>
 #include <algorithm>
 #include <array>
+#include <cstdlib>
 #include <cstring>
 #include <numeric>
 #include <random>
@@ -3709,7 +3710,9 @@ ggml_tensor * llm_graph_context::build_attn(
     return cur;
 }
 
-// the iswa build_attn with the KQ mask and kv_rows given by the caller, which has to keep them in sync
+// The caller supplies either the attention inputs or a function that builds attention after the KV stores.
+using llama_attn_builder = std::function<ggml_tensor *(ggml_tensor *, ggml_tensor *, ggml_tensor *)>;
+
 static ggml_tensor * build_attn_iswa_impl(
         const llm_graph_context & gctx,
         llm_graph_input_attn_kv_iswa * inp,
@@ -3725,7 +3728,8 @@ static ggml_tensor * build_attn_iswa_impl(
         ggml_tensor * sinks,
         ggml_tensor * v_mla,
             float     kq_scale,
-            int       il) {
+            int       il,
+        const llama_attn_builder & build_attn = {}) {
     ggml_context * ctx0 = gctx.ctx0;
     ggml_cgraph  * gf   = gctx.gf;
 
@@ -3791,7 +3795,8 @@ static ggml_tensor * build_attn_iswa_impl(
     ggml_tensor * k = use_kv_cur ? k_cur : mctx_cur->get_k(ctx0, il);
     ggml_tensor * v = use_kv_cur ? v_cur : mctx_cur->get_v(ctx0, il);
 
-    ggml_tensor * cur = gctx.build_attn_mha(q, k, v, kq_b, kq_mask, kv_rows, sinks, v_mla, 0, kq_scale, il);
+    ggml_tensor * cur = build_attn ? build_attn(q, k, v) :
+        gctx.build_attn_mha(q, k, v, kq_b, kq_mask, kv_rows, sinks, v_mla, 0, kq_scale, il);
     cur = build_attn_scale_kv_output(ctx0, mctx_cur, cur, il);
     gctx.cb(cur, "kqv_out", il);
 
@@ -4446,6 +4451,20 @@ llm_graph_input_mem_hybrid_iswa_rel * llm_graph_context::build_inp_mem_hybrid_is
     return (llm_graph_input_mem_hybrid_iswa_rel *) res->add_input(std::move(inp));
 }
 
+static int64_t inkling_attention_chunk_size(int64_t queries, int64_t keys, int64_t heads) {
+    // Limit one F32 mask or score tensor to 32 MiB, with at most eight chunks per layer.
+    constexpr int64_t budget = 32*1024*1024;
+    int64_t chunk = budget/sizeof(float)/std::max<int64_t>(keys, 1)/heads;
+    if (const char * env = std::getenv("LLAMA_INKLING_ATTN_CHUNK")) {
+        char * end = nullptr;
+        const long requested = std::strtol(env, &end, 10);
+        if (end != env && *end == '\0' && requested >= 0) {
+            chunk = requested == 0 ? queries : requested;
+        }
+    }
+    return std::clamp(chunk, (queries + 7)/8, queries);
+}
+
 ggml_tensor * llm_graph_context::build_attn(
         llm_graph_input_mem_hybrid_iswa_rel * inp,
         ggml_tensor * wo,
@@ -4454,32 +4473,74 @@ ggml_tensor * llm_graph_context::build_attn(
         ggml_tensor * q_cur,
         ggml_tensor * k_cur,
         ggml_tensor * v_cur,
-        ggml_tensor * kq_b,
+        ggml_tensor * rel_bias,
         ggml_tensor * sinks,
             float     kq_scale,
             int       il) const {
     const bool is_swa = hparams.is_swa(il);
-
     auto * inp_attn = inp->get_attn();
-
     const auto & attn_mask = is_swa ? inp_attn->self_attn_mask_swa : inp_attn->self_attn_mask;
-
-    // TODO: support kv_rows - fill the distances over the kv_rows cell lists and pass the rows to build_attn_mha,
-    //       needs a kv_rows flash attention with a per-head mask (CUDA has none)
+    ggml_tensor * rel_pos = is_swa ? inp->self_rel_pos_swa : inp->self_rel_pos;
+    ggml_tensor * raw_mask = attn_mask.raw;
     GGML_ASSERT(attn_mask.rows == nullptr);
 
-    // a mask per head, in the dense layout of the input mask, which flash attention takes in F16
-    ggml_tensor * kq_mask = attn_mask.raw;
-    if (kq_mask->type != GGML_TYPE_F32) {
-        kq_mask = ggml_cast(ctx0, kq_mask, GGML_TYPE_F32);
-    }
-    kq_mask = ggml_add(ctx0, kq_b, kq_mask);
-    if (cparams.flash_attn) {
-        kq_mask = ggml_cast(ctx0, kq_mask, GGML_TYPE_F16);
-    }
-    cb(kq_mask, "kq_mask_rel_pos", il);
+    auto build_mask = [&](ggml_tensor * mask, ggml_tensor * positions, ggml_tensor * bias) {
+        ggml_tensor * kq_b = ggml_get_rows(ctx0, bias, positions);
+        kq_b = ggml_reshape_4d(ctx0, kq_b, bias->ne[0], mask->ne[0], mask->ne[1], mask->ne[3]);
+        kq_b = ggml_cont(ctx0, ggml_permute(ctx0, kq_b, 2, 0, 1, 3));
+        cb(kq_b, "kq_b", il);
 
-    return build_attn_iswa_impl(*this, inp_attn, wo, wo_b, wo_s, q_cur, k_cur, v_cur, nullptr, kq_mask, nullptr, sinks, nullptr, kq_scale, il);
+        if (mask->type != GGML_TYPE_F32) {
+            mask = ggml_cast(ctx0, mask, GGML_TYPE_F32);
+        }
+        mask = ggml_add(ctx0, kq_b, mask);
+        if (cparams.flash_attn) {
+            mask = ggml_cast(ctx0, mask, GGML_TYPE_F16);
+        }
+        cb(mask, "kq_mask_rel_pos", il);
+        return mask;
+    };
+
+    // The chunk stores use ggml_set, which takes an int32 byte offset.
+    const int64_t out_row_bytes = int64_t(hparams.n_embd_head_v(il))*q_cur->ne[1]*sizeof(float);
+    int64_t chunk_size = n_tokens;
+    if (!cparams.training && raw_mask->ne[3] == 1 &&
+            n_tokens <= INT32_MAX/out_row_bytes) {
+        chunk_size = inkling_attention_chunk_size(n_tokens, raw_mask->ne[0], rel_bias->ne[0]);
+    }
+
+    if (chunk_size == n_tokens) {
+        auto * mask = build_mask(raw_mask, rel_pos, rel_bias);
+        return build_attn_iswa_impl(*this, inp_attn, wo, wo_b, wo_s, q_cur, k_cur, v_cur,
+                                    nullptr, mask, nullptr, sinks, nullptr, kq_scale, il);
+    }
+
+    const llama_attn_builder build_chunks = [&](ggml_tensor * q, ggml_tensor * k, ggml_tensor * v) {
+        ggml_tensor * out = nullptr;
+        for (int64_t start = 0; start < n_tokens; start += chunk_size) {
+            const int64_t count = std::min(chunk_size, n_tokens - start);
+            auto * raw_slice = ggml_view_2d(ctx0, raw_mask, raw_mask->ne[0], count, raw_mask->nb[1], start*raw_mask->nb[1]);
+            auto * pos_slice = ggml_view_2d(ctx0, rel_pos, rel_pos->ne[0], count, rel_pos->nb[1], start*rel_pos->nb[1]);
+            auto * bias_slice = ggml_view_3d(ctx0, rel_bias, rel_bias->ne[0], rel_bias->ne[1], count,
+                                            rel_bias->nb[1], rel_bias->nb[2], start*rel_bias->nb[2]);
+            auto * q_slice = ggml_view_3d(ctx0, q, q->ne[0], q->ne[1], count, q->nb[1], q->nb[2], start*q->nb[2]);
+
+            auto * mask = build_mask(raw_slice, pos_slice, bias_slice);
+            auto * rows = build_attn_mha(q_slice, k, v, nullptr, mask, nullptr, sinks, nullptr, 0, kq_scale, il);
+            if (out == nullptr) {
+                out = ggml_pad(ctx0, rows, 0, int(n_tokens - count), 0, 0);
+            } else {
+                out = ggml_set_2d_inplace(ctx0, out, rows, out->nb[1], start*out->nb[1]);
+            }
+
+            // Expand each chunk before the next one so their attention work buffers can be reused.
+            ggml_build_forward_expand(gf, out);
+        }
+        return out;
+    };
+
+    return build_attn_iswa_impl(*this, inp_attn, wo, wo_b, wo_s, q_cur, k_cur, v_cur,
+                                nullptr, nullptr, nullptr, sinks, nullptr, kq_scale, il, build_chunks);
 }
 
 void llm_graph_context::build_dense_out(

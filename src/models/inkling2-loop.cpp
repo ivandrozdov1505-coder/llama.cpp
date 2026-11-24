@@ -1,6 +1,6 @@
 #include "models.h"
 
-int llama_model_inkling2_loop::layer_phys(int il) const {
+int llama_model_inkling2_loop::layer_placement(int il) const {
     return il < n_phys ? il : core_start + (il - n_phys) % (core_end - core_start);
 }
 
@@ -29,7 +29,7 @@ void llama_model_inkling2_loop::load_arch_hparams(llama_model_loader & ml) {
     // expand to the cache slots before load_tensors() allocates the layers and the memory
     hparams.n_layer_all = n_slot;
     for (int il = n_phys; il < (int) n_slot; ++il) {
-        const int p = layer_phys(il);
+        const int p = layer_placement(il);
         hparams.n_head_arr[il]        = hparams.n_head_arr[p];
         hparams.n_head_kv_arr[il]     = hparams.n_head_kv_arr[p];
         hparams.n_ff_arr[il]          = hparams.n_ff_arr[p];
@@ -65,7 +65,7 @@ void llama_model_inkling2_loop::load_arch_tensors(llama_model_loader & ml) {
 void llama_model_inkling2_loop::post_arch_tensors(llama_model_loader &) {
     // share the physical weights, each cache slot keeps its own KV and conv state
     for (int il = n_phys; il < (int) hparams.n_layer(); ++il) {
-        layers[il] = layers[layer_phys(il)];
+        layers[il] = layers[layer_placement(il)];
     }
 }
 
@@ -89,11 +89,10 @@ llama_model_inkling2_loop::graph::graph(const llm_graph_params & params) : llama
     const auto prelude_blocks = blocks;
     for (uint32_t pass = 0; pass < m.n_passes; ++pass) {
         // the bank of the previous pass: its blocks after the first core block, and its output
-        std::vector<ggml_tensor *> bank;
-        ggml_tensor * bank_out = nullptr;
+        mix_state bank = {};
         if (pass > 0) {
-            bank.assign(blocks.begin() + prelude_blocks.size() + 1, blocks.end());
-            bank_out = cur;
+            const std::vector<ggml_tensor *> prior_blocks(blocks.begin() + prelude_blocks.size() + 1, blocks.end());
+            bank = prepare_mix(prior_blocks, cur);
             cur = prelude;
             blocks = prelude_blocks;
         }
@@ -104,7 +103,7 @@ llama_model_inkling2_loop::graph::graph(const llm_graph_params & params) : llama
                 continue;
             }
             const auto & loop = m.loop_layers[ip - start];
-            cur = build_layer(il, ip, cur, blocks, mix(bank, bank_out, loop.msg_query), &loop);
+            cur = build_layer(il, ip, cur, blocks, mix(bank, loop.msg_query), &loop);
         }
     }
 

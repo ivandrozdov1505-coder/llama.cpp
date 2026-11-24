@@ -869,7 +869,8 @@ struct ggml_backend_opencl_context {
     cl_kernel kernel_sub, kernel_sub_row, kernel_sub_f16, kernel_sub_row_f16;
     cl_kernel kernel_add_id;
     cl_kernel kernel_add_id_add_id_swiglu_oai;
-    cl_kernel kernel_scale_f32, kernel_scale_f32_4;
+    cl_kernel kernel_scale_f32, kernel_scale_f32_4, kernel_scale_f32_nc;
+    cl_kernel kernel_situ_f32 = nullptr;
     cl_kernel kernel_sqr_cont_f32, kernel_sqr_cont_f32_4, kernel_sqr_cont_f16, kernel_sqr_cont_f16_4;
     cl_kernel kernel_sqrt_cont_f32, kernel_sqrt_cont_f32_4, kernel_sqrt_cont_f16, kernel_sqrt_cont_f16_4;
     cl_kernel kernel_mean_f32, kernel_mean_f32_4;
@@ -4552,7 +4553,27 @@ static void load_cl_kernels(ggml_backend_opencl_context *backend_ctx) {
 
         CL_CHECK((backend_ctx->kernel_scale_f32   = clCreateKernel(prog, "kernel_scale_f32", &err), err));
         CL_CHECK((backend_ctx->kernel_scale_f32_4 = clCreateKernel(prog, "kernel_scale_f32_4", &err), err));
+        CL_CHECK((backend_ctx->kernel_scale_f32_nc = clCreateKernel(prog, "kernel_scale_f32_nc", &err), err));
         CL_CHECK(clReleaseProgram(prog));
+        GGML_LOG_CONT(".");
+    }
+
+    // Fused SiTU is optional. The regular elementwise kernels can run the same graph.
+    {
+#ifdef GGML_OPENCL_EMBED_KERNELS
+        const std::string kernel_src {
+            #include "situ.cl.h"
+        };
+#else
+        const std::string kernel_src = read_file("situ.cl");
+#endif
+        if (cl_program prog = build_program_from_source(backend_ctx, kernel_src.c_str(), compile_opts, false)) {
+            cl_kernel kernel = clCreateKernel(prog, "kernel_situ_f32", &err);
+            CL_CHECK(clReleaseProgram(prog));
+            if (err == CL_SUCCESS) {
+                backend_ctx->kernel_situ_f32 = kernel;
+            }
+        }
         GGML_LOG_CONT(".");
     }
 
@@ -11618,6 +11639,126 @@ static void ggml_opencl_op_rms_norm_mul_add_fused(ggml_backend_t backend, ggml_t
     backend_ctx->enqueue_ndrange_kernel(kernel, 3, global_work_size, local_work_size, dst);
 }
 
+// Match scale(tanh(scale(gate))) * sigmoid(gate) followed by the multiply with up.
+static bool ggml_cl_situ_tanh_chain(const ggml_tensor * in, const ggml_tensor * tanh, const ggml_tensor * out) {
+    return in->op == GGML_OP_SCALE && tanh->op == GGML_OP_UNARY && out->op == GGML_OP_SCALE &&
+           ggml_get_unary_op(tanh) == GGML_UNARY_OP_TANH && tanh->src[0] == in && out->src[0] == tanh &&
+           ggml_get_op_params_f32(in, 1) == 0.0f && ggml_get_op_params_f32(out, 1) == 0.0f;
+}
+
+static int ggml_cl_try_fuse_situ(ggml_backend_opencl_context * ctx, const ggml_cgraph * graph, int start) {
+    cl_kernel kernel = ctx->kernel_situ_f32;
+    if (!kernel || start + 5 >= graph->n_nodes) {
+        return 0;
+    }
+
+    const auto * gate_in = graph->nodes[start];
+    const auto * gate = gate_in->src[0];
+    if (gate_in->op != GGML_OP_SCALE || gate->op != GGML_OP_VIEW || gate->type != GGML_TYPE_F32 ||
+            gate->ne[3] != 1 || !gate->view_src || gate->view_src->op != GGML_OP_MUL_MAT_ID) {
+        return 0;
+    }
+
+    const auto * gate_tanh = graph->nodes[start + 1];
+    const auto * gate_out = graph->nodes[start + 2];
+    const auto * sigmoid = graph->nodes[start + 3];
+    const auto * product = graph->nodes[start + 4];
+    if (!ggml_cl_situ_tanh_chain(gate_in, gate_tanh, gate_out) ||
+            sigmoid->op != GGML_OP_UNARY || ggml_get_unary_op(sigmoid) != GGML_UNARY_OP_SIGMOID ||
+            sigmoid->src[0] != gate || product->op != GGML_OP_MUL ||
+            product->src[0] != gate_out || product->src[1] != sigmoid) {
+        return 0;
+    }
+
+    int last = start + 5;
+    if (graph->nodes[last]->op == GGML_OP_VIEW && ++last >= graph->n_nodes) {
+        return 0;
+    }
+    const auto * up_in = graph->nodes[last];
+    const auto * up = up_in->src[1];
+    const auto * up_out = up;
+    const bool clamp_up = up_in->op == GGML_OP_SCALE;
+    if (clamp_up) {
+        if (last + 3 >= graph->n_nodes) {
+            return 0;
+        }
+        up = up_in->src[0];
+        up_out = graph->nodes[last + 2];
+        if (!ggml_cl_situ_tanh_chain(up_in, graph->nodes[last + 1], up_out) ||
+                ggml_get_op_params_f32(up_out, 0) <= 0.0f) {
+            return 0;
+        }
+        last += 3;
+    }
+
+    const auto * dst = graph->nodes[last];
+    if (dst->op != GGML_OP_MUL || dst->src[0] != product || dst->src[1] != up_out ||
+            up == nullptr || up->op != GGML_OP_VIEW || up->view_src != gate->view_src ||
+            !ggml_are_same_shape(gate, up) || !ggml_are_same_stride(gate, up) ||
+            gate->nb[0] != sizeof(float) || !ggml_is_contiguous(dst)) {
+        return 0;
+    }
+
+    int indices[9] = {start, start + 1, start + 2, start + 3, start + 4};
+    const ggml_op ops[] = {GGML_OP_SCALE, GGML_OP_UNARY, GGML_OP_SCALE, GGML_OP_UNARY, GGML_OP_MUL,
+                          GGML_OP_SCALE, GGML_OP_UNARY, GGML_OP_SCALE, GGML_OP_MUL};
+    if (clamp_up) {
+        indices[5] = last - 3;
+        indices[6] = last - 2;
+        indices[7] = last - 1;
+        indices[8] = last;
+        if (!ggml_can_fuse_subgraph_ext(graph, indices, 9, ops, &last, 1)) {
+            return 0;
+        }
+    } else {
+        indices[5] = last;
+        const ggml_op unclamped[] = {GGML_OP_SCALE, GGML_OP_UNARY, GGML_OP_SCALE,
+                                     GGML_OP_UNARY, GGML_OP_MUL, GGML_OP_MUL};
+        if (!ggml_can_fuse_subgraph_ext(graph, indices, 6, unclamped, &last, 1)) {
+            return 0;
+        }
+    }
+
+    const auto * gate_cl = static_cast<const ggml_tensor_extra_cl *>(gate->extra);
+    const auto * up_cl = static_cast<const ggml_tensor_extra_cl *>(up->extra);
+    const auto * out_cl = static_cast<const ggml_tensor_extra_cl *>(dst->extra);
+    if (!gate_cl || !up_cl || !out_cl || gate_cl->data_device != up_cl->data_device) {
+        return 0;
+    }
+
+    const cl_ulong gate_offset = gate_cl->offset + gate->view_offs;
+    const cl_ulong up_offset = up_cl->offset + up->view_offs;
+    const cl_ulong out_offset = out_cl->offset + dst->view_offs;
+    // The graph allocator can reuse intermediate storage for the output.
+    if (gate_cl->data_device == out_cl->data_device &&
+            out_offset < std::max(gate_offset, up_offset) + ggml_nbytes(gate) &&
+            std::min(gate_offset, up_offset) < out_offset + ggml_nbytes(dst)) {
+        return 0;
+    }
+
+    cl_uint arg = 0;
+    auto set = [&](auto value) {
+        CL_CHECK(clSetKernelArg(kernel, arg++, sizeof(value), &value));
+    };
+    set(gate_cl->data_device);
+    set(gate_offset);
+    set(up_offset);
+    set(out_cl->data_device);
+    set(out_offset);
+    set(cl_ulong(gate->ne[0]));
+    set(cl_ulong(gate->nb[1]));
+    set(cl_ulong(gate->nb[2]));
+    set(ggml_get_op_params_f32(gate_in, 0));
+    set(ggml_get_op_params_f32(gate_out, 0));
+    set(clamp_up ? ggml_get_op_params_f32(up_in, 0) : 0.0f);
+    set(clamp_up ? ggml_get_op_params_f32(up_out, 0) : 0.0f);
+
+    size_t local[] = {64, 1, 1};
+    size_t global[] = {GGML_PAD(size_t(gate->ne[0]), 64), size_t(gate->ne[1]), size_t(gate->ne[2])};
+    ctx->enqueue_ndrange_kernel(kernel, 3, global, local, dst);
+    return last - start;
+}
+
 static ggml_status ggml_backend_opencl_graph_compute(ggml_backend_t backend, ggml_cgraph * cgraph) {
     ggml_backend_opencl_context *backend_ctx = (ggml_backend_opencl_context *)backend->context;
 
@@ -11712,6 +11853,13 @@ static ggml_status ggml_backend_opencl_graph_compute(ggml_backend_t backend, ggm
             continue;
         }
 #endif
+
+        if (!backend_ctx->disable_fusion && node->op == GGML_OP_SCALE) {
+            if (int n = ggml_cl_try_fuse_situ(backend_ctx, cgraph, i)) {
+                i += n;
+                continue;
+            }
+        }
 
         bool ok = ggml_cl_compute_forward(backend, node);
         if (!ok) {
@@ -12427,7 +12575,8 @@ static bool ggml_opencl_supports_op(ggml_backend_dev_t dev, const struct ggml_te
                     op->type == op->src[1]->type;
         }
         case GGML_OP_SCALE:
-            return op->src[0]->type == GGML_TYPE_F32 && ggml_is_contiguous(op->src[0]);
+            return op->src[0]->type == GGML_TYPE_F32 && op->type == GGML_TYPE_F32 &&
+                   op->src[0]->nb[0] == sizeof(float) && op->nb[0] == sizeof(float);
         case GGML_OP_ADD:
             if (op->type == GGML_TYPE_F16) {
                 const bool src0_ok = op->src[0]->type == GGML_TYPE_F16 || op->src[0]->type == GGML_TYPE_F32;
@@ -39130,14 +39279,10 @@ static void ggml_cl_scale(ggml_backend_t backend, const ggml_tensor * src0, cons
     GGML_ASSERT(dst->extra);
     GGML_UNUSED(src1);
 
-    GGML_ASSERT(ggml_is_contiguous(src0));
-
     ggml_backend_opencl_context *backend_ctx = (ggml_backend_opencl_context *)backend->context;
 
-    float scale;
-    float bias;
-    memcpy(&scale, ((int32_t *) dst->op_params) + 0, sizeof(float));
-    memcpy(&bias,  ((int32_t *) dst->op_params) + 1, sizeof(float));
+    const float scale = ggml_get_op_params_f32(dst, 0);
+    const float bias = ggml_get_op_params_f32(dst, 1);
 
     ggml_tensor_extra_cl * extra0 = (ggml_tensor_extra_cl *)src0->extra;
     ggml_tensor_extra_cl * extrad = (ggml_tensor_extra_cl *)dst->extra;
@@ -39145,11 +39290,36 @@ static void ggml_cl_scale(ggml_backend_t backend, const ggml_tensor * src0, cons
     cl_ulong offset0 = extra0->offset + src0->view_offs;
     cl_ulong offsetd = extrad->offset + dst->view_offs;
 
+    if (!ggml_is_contiguous(src0) || !ggml_is_contiguous(dst)) {
+        cl_kernel kernel = backend_ctx->kernel_scale_f32_nc;
+        cl_uint arg = 0;
+        auto set = [&](auto value) {
+            CL_CHECK(clSetKernelArg(kernel, arg++, sizeof(value), &value));
+        };
+        set(extra0->data_device);
+        set(offset0);
+        set(extrad->data_device);
+        set(offsetd);
+        set(scale);
+        set(bias);
+        set(cl_ulong(dst->ne[0]));
+        for (int dim = 1; dim < GGML_MAX_DIMS; ++dim) {
+            set(cl_ulong(src0->nb[dim]));
+        }
+        for (int dim = 1; dim < GGML_MAX_DIMS; ++dim) {
+            set(cl_ulong(dst->nb[dim]));
+        }
+
+        size_t local[] = {64, 1, 1};
+        size_t global[] = {64*size_t(dst->ne[1]), size_t(dst->ne[2]), size_t(dst->ne[3])};
+        backend_ctx->enqueue_ndrange_kernel(kernel, 3, global, local, dst);
+        return;
+    }
+
     cl_kernel kernel;
+    size_t n = ggml_nelements(dst);
 
-    int n = ggml_nelements(dst);
-
-    if (n % 4 == 0) {
+    if (n % 4 == 0 && offset0 % 16 == 0 && offsetd % 16 == 0) {
         kernel = backend_ctx->kernel_scale_f32_4;
         n /= 4;
     } else {

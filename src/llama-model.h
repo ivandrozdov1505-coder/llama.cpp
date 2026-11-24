@@ -1040,6 +1040,10 @@ struct llama_model {
     size_t n_devices() const;
     const float * tensor_split() const;
 
+    // Cache slots of a repeated layer can share its device placement.
+    virtual uint32_t n_layer_placement() const { return hparams.n_layer_all; }
+    virtual int layer_placement(int il) const { return il; }
+
     uint32_t n_gpu_layers() const;
     llama_split_mode split_mode() const;
     bool no_alloc() const;

@@ -376,6 +376,7 @@ set(GGML_OPENCL_KERNELS
     scale
     set_rows
     sigmoid
+    situ
     silu
     softmax_4_f32
     softmax_4_f16

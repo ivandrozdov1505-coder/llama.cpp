@@ -1812,6 +1812,7 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
     const auto & tensor_split = params.tensor_split;
 
     const int n_layer_all = hparams.n_layer_all;
+    const int n_placement = n_layer_placement();
     const int n_gpu_layers = this->n_gpu_layers();
 
     const bool use_mmap_buffer = true;
@@ -1895,10 +1896,10 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
         splits[i] = split_sum != 0.0f ? splits[i] / split_sum : float(i + 1) / n_devices();
     }
 
-    const int i_gpu_start = std::max(n_layer_all + 1 - n_gpu_layers, 0);
-    const int act_gpu_layers = devices.empty() ? 0 : std::min(n_gpu_layers, n_layer_all + 1);
+    const int i_gpu_start = std::max(n_placement + 1 - n_gpu_layers, 0);
+    const int act_gpu_layers = devices.empty() ? 0 : std::min(n_gpu_layers, n_placement + 1);
     auto get_layer_buft_list = [&](int il) -> llama_model::impl::layer_dev {
-        const bool is_swa = il < n_layer_all && hparams.is_swa(il);
+        const bool is_swa = il < n_placement && hparams.is_swa(il);
         if (il < i_gpu_start || (il - i_gpu_start) >= act_gpu_layers) {
             LLAMA_LOG_DEBUG("load_tensors: layer %3d assigned to device %s, is_swa = %d\n", il, ggml_backend_dev_name(cpu_dev), is_swa);
             return {cpu_dev, &pimpl->cpu_buft_list};
@@ -1915,12 +1916,15 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
 
     // assign the repeating layers to the devices according to the splits
     pimpl->dev_layer.resize(n_layer_all);
-    for (int il = 0; il < n_layer_all; ++il) {
+    for (int il = 0; il < n_placement; ++il) {
         pimpl->dev_layer[il] = get_layer_buft_list(il);
+    }
+    for (int il = n_placement; il < n_layer_all; ++il) {
+        pimpl->dev_layer[il] = pimpl->dev_layer.at(layer_placement(il));
     }
 
     // assign the output layer
-    pimpl->dev_output = get_layer_buft_list(n_layer_all);
+    pimpl->dev_output = get_layer_buft_list(n_placement);
 
     const auto TENSOR_NOT_REQUIRED = llama_model_loader::TENSOR_NOT_REQUIRED;
 
@@ -2273,19 +2277,11 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
     }
 
     if (llama_supports_gpu_offload()) {
-        const int n_gpu = std::min(n_gpu_layers, n_layer_all);
-
-        int n_repeating = n_gpu;
-        if (n_repeating > 0) {
+        if (act_gpu_layers > 0) {
             LLAMA_LOG_INFO("%s: offloading output layer to GPU\n", __func__);
-            n_repeating--;
         }
-        LLAMA_LOG_INFO("%s: offloading %d repeating layers to GPU\n", __func__, n_repeating);
-
-        const int max_backend_supported_layers = n_layer_all + 1;
-        const int max_offloadable_layers       = n_layer_all + 1;
-
-        LLAMA_LOG_INFO("%s: offloaded %d/%d layers to GPU\n", __func__, std::min(n_gpu_layers, max_offloadable_layers), max_backend_supported_layers);
+        LLAMA_LOG_INFO("%s: offloading %d repeating layers to GPU\n", __func__, std::max(0, act_gpu_layers - 1));
+        LLAMA_LOG_INFO("%s: offloaded %d/%d layers to GPU\n", __func__, act_gpu_layers, n_placement + 1);
     }
 
     // print memory requirements per buffer type
@@ -2711,7 +2707,7 @@ const float * llama_model::tensor_split() const {
 
 uint32_t llama_model::n_gpu_layers() const {
     // note: plus 1 for the "output" layer
-    return params.n_gpu_layers >= 0 ? params.n_gpu_layers : hparams.n_layer_all + 1;
+    return params.n_gpu_layers >= 0 ? params.n_gpu_layers : n_layer_placement() + 1;
 }
 
 llama_split_mode llama_model::split_mode() const {
@@ -3793,6 +3789,10 @@ int32_t llama_model_n_embd_out(const llama_model * model) {
 
 int32_t llama_model_n_layer(const llama_model * model) {
     return model->hparams.n_layer();
+}
+
+uint32_t llama_model_n_layer_placement(const llama_model * model) {
+    return model->n_layer_placement();
 }
 
 int32_t llama_model_n_layer_nextn(const llama_model * model) {

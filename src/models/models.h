@@ -2527,7 +2527,8 @@ struct llama_model_inkling2 : public llama_model_base {
     llama_model_inkling2(const struct llama_model_params & params) : llama_model_base(params) {}
     void load_arch_hparams(llama_model_loader & ml) override;
     void load_arch_tensors(llama_model_loader & ml) override;
-    uint32_t graph_nodes_per_tensor() const override { return 32; }
+    // Allow for the extra nodes of the chunked relative-attention graph.
+    uint32_t graph_nodes_per_tensor() const override { return 48; }
 
     // the layers stored in the file
     virtual int n_layer_phys() const { return hparams.n_layer(); }
@@ -2544,6 +2545,13 @@ struct llama_model_inkling2 : public llama_model_base {
 
     struct graph : public llm_graph_context {
         graph(const llm_graph_params & params);
+        struct mix_state {
+            ggml_tensor * states;
+            ggml_tensor * transposed;
+        };
+
+        mix_state prepare_mix(const std::vector<ggml_tensor *> & blocks, ggml_tensor * cur);
+        ggml_tensor * mix(mix_state state, ggml_tensor * query);
         ggml_tensor * mix(const std::vector<ggml_tensor *> & blocks, ggml_tensor * cur, ggml_tensor * query);
         ggml_tensor * clip(ggml_tensor * cur, ggml_tensor * scale, float threshold);
         ggml_tensor * convolve(
@@ -2569,7 +2577,6 @@ struct llama_model_inkling2 : public llama_model_base {
         void build_output(ggml_tensor * cur, const std::vector<ggml_tensor *> & blocks);
 
         llm_graph_input_mem_hybrid_iswa_rel * inp  = nullptr;
-        llm_graph_input_attn_kv_iswa        * attn = nullptr;
         llm_graph_input_rs                  * recr = nullptr;
 
         ggml_tensor * inp_out_ids = nullptr;
@@ -2587,7 +2594,8 @@ struct llama_model_inkling2_loop : public llama_model_inkling2 {
     void post_arch_tensors(llama_model_loader & ml) override;
 
     int n_layer_phys() const override { return n_phys; }
-    int layer_phys(int il) const;
+    uint32_t n_layer_placement() const override { return n_layer_phys(); }
+    int layer_placement(int il) const override;
 
     int      n_phys     = 0;
     uint32_t core_start = 0;

@@ -83,12 +83,25 @@ such as Inkling 2 Mini `Q2_K`, where down projections can use `Q3_K`.
 These kernels require `GGML_OPENCL_USE_ADRENO_KERNELS=ON` and use the
 existing flat OpenCL weight layout.
 
+On Inkling 2 Mini, `-ngl` counts physical layers and the output layer. Cache slots
+for repeated passes inherit the placement of their physical layer. For example,
+`-ngl 8` selects seven physical layers and the output layer, subject to backend
+operation support.
+
 Compare prompt processing and token generation with the same model, GPU layer count and batch sizes:
 
 ```sh
 GGML_OPENCL_ADRENO_LOWBIT_MOE=0 llama-bench -m "$MODEL" -ngl 8 -p 256 -n 128 -r 3
 GGML_OPENCL_ADRENO_LOWBIT_MOE=1 llama-bench -m "$MODEL" -ngl 8 -p 256 -n 128 -r 3
 ```
+
+Inkling 2 Mini uses fused SiTU in OpenCL when its gate/up graph matches.
+`GGML_OPENCL_DISABLE_FUSION=1` disables OpenCL graph fusions for debugging.
+
+Relative attention builds its mask in query chunks when the mask exceeds
+the temporary memory budget. The chunks share the same KV cache.
+`LLAMA_INKLING_ATTN_CHUNK=0` uses the full query batch. A positive value requests
+a smaller chunk size, bounded by a maximum of eight chunks per layer.
 
 ## Model Preparation
 

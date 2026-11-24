@@ -149,12 +149,9 @@ static std::vector<llama_device_memory_data> common_get_device_memory_data_impl(
         devs.push_back(llama_model_get_device(model, i));
     }
 
-    hp_ngl         = llama_model_n_layer(model);
-    if (mparams->load_mtp) {
-        hp_ngl    += llama_model_n_layer_nextn(model);
-    }
     // without MTP the NextN layers hold no weights but the model loader still counts them for n_gpu_layers
     hp_ngl_skip    = mparams->load_mtp ? 0 : llama_model_n_layer_nextn(model);
+    hp_ngl         = llama_model_n_layer_placement(model) - hp_ngl_skip;
     hp_n_ctx_train = llama_model_n_ctx_train(model);
     hp_n_expert    = llama_model_n_expert(model);
 

@@ -116,6 +116,8 @@ LLAMA_API ggml_backend_dev_t llama_model_get_device(const struct llama_model * m
 
 LLAMA_API llama_memory_breakdown llama_get_memory_breakdown(const struct llama_context * ctx);
 
+LLAMA_API uint32_t llama_model_n_layer_placement(const struct llama_model * model);
+
 LLAMA_API std::vector<ggml_tensor *> llama_memory_get_tensors(const llama_memory_t mem);
 
 // the backend buffers that a state write of this memory would touch - empty caches report none

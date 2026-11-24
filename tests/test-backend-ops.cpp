@@ -6205,6 +6205,31 @@ struct test_mul_mat_id : public test_case {
     }
 };
 
+// SiTU following a packed gate/up expert projection.
+struct test_moe_situ : public test_mul_mat_id {
+    const bool clamp_up;
+
+    test_moe_situ(int64_t tokens, bool clamp_up) :
+        test_mul_mat_id(GGML_TYPE_F32, GGML_TYPE_F32, 4, 2, true, 70, tokens, 128),
+        clamp_up(clamp_up) {}
+
+    std::string op_desc(ggml_tensor *) override { return "MOE_SITU"; }
+    std::string vars() override { return VARS_TO_STR2(n, clamp_up); }
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        auto * packed = test_mul_mat_id::build_graph(ctx);
+        const int64_t width = packed->ne[0]/2;
+        auto * gate = ggml_view_3d(ctx, packed, width, packed->ne[1], packed->ne[2], packed->nb[1], packed->nb[2], 0);
+        auto * up = ggml_view_3d(ctx, packed, width, packed->ne[1], packed->ne[2], packed->nb[1], packed->nb[2], width*packed->nb[0]);
+        auto * bounded = ggml_scale(ctx, ggml_tanh(ctx, ggml_scale(ctx, gate, 0.25f)), 4.0f);
+        auto * activation = ggml_mul(ctx, bounded, ggml_sigmoid(ctx, gate));
+        if (clamp_up) {
+            up = ggml_scale(ctx, ggml_tanh(ctx, ggml_scale(ctx, up, 0.04f)), 25.0f);
+        }
+        return ggml_mul(ctx, activation, up);
+    }
+};
+
 // MUL_MAT_ID with expert ids repeated within a token's row
 struct test_mul_mat_id_dup : public test_mul_mat_id {
     using test_mul_mat_id::test_mul_mat_id;
@@ -12806,6 +12831,11 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
             }
             test_cases.emplace_back(new test_mul_mat_id(type, GGML_TYPE_F32, 37, 2, false, 65, n, 256, 0, false, true));
         }
+    }
+
+    for (bool clamp_up : {false, true}) {
+        test_cases.emplace_back(new test_moe_situ(1, clamp_up));
+        test_cases.emplace_back(new test_moe_situ(7, clamp_up));
     }
 
     // Low-bit experts with a tail row, offset routing IDs and skipped slots.

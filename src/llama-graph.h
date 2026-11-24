@@ -1547,7 +1547,7 @@ struct llm_graph_context {
             uint32_t extent,
             uint32_t extent_swa) const;
 
-    // kq_b is added to the KQ mask, after the KQ scale
+    // Gather from rel_bias and add it to the KQ mask after the KQ scale.
     ggml_tensor * build_attn(
             llm_graph_input_mem_hybrid_iswa_rel * inp,
             ggml_tensor * wo,
@@ -1556,7 +1556,7 @@ struct llm_graph_context {
             ggml_tensor * q_cur, // [n_embd_head_q, n_head_q, n_tokens]
             ggml_tensor * k_cur, // [n_embd_head_k, n_head_k, n_tokens]
             ggml_tensor * v_cur, // [n_embd_head_v, n_head_v, n_tokens]
-            ggml_tensor * kq_b,  // [n_kv, n_tokens/n_stream, n_head_q, n_stream]
+            ggml_tensor * rel_bias, // [n_head_q, extent + 1, n_tokens]
             ggml_tensor * sinks, // [n_head_q]
                   float   kq_scale,
                     int   il) const;
