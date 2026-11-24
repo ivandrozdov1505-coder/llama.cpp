@@ -1227,6 +1227,12 @@ struct ggml_backend_opencl_context {
     cl_kernel kernel_mul_mv_id_f32_f32;
     cl_kernel kernel_mul_mm_id_f32_f32;
     cl_kernel kernel_mul_mv_id_q4_0_f32_8x_flat;
+    cl_kernel kernel_mul_mv_id_q2_K_f32_flat = nullptr;
+    cl_kernel kernel_mul_mv_id_q3_K_f32_flat = nullptr;
+    cl_kernel kernel_mul_mv_id_iq2_s_f32_flat = nullptr;
+    cl_kernel kernel_mul_mv_id_iq2_xs_f32_flat = nullptr;
+    cl_kernel kernel_mul_mv_id_iq2_xxs_f32_flat = nullptr;
+    cl_kernel kernel_mul_mv_id_iq3_s_f32_flat = nullptr;
     cl_kernel kernel_mul_mv_id_q8_0_f32, kernel_mul_mv_id_q8_0_f32_flat;
     cl_kernel kernel_mul_mv_id_mxfp4_f32;
     cl_kernel kernel_mul_mv_id_mxfp4_f32_flat;
@@ -2935,6 +2941,44 @@ static void load_cl_kernels(ggml_backend_opencl_context *backend_ctx) {
         GGML_LOG_CONT(".");
     }
 
+#ifdef GGML_OPENCL_USE_ADRENO_KERNELS
+    const char * moe_lowbit_env = getenv("GGML_OPENCL_ADRENO_LOWBIT_MOE");
+    const bool use_moe_lowbit = backend_ctx->adreno_gen == ADRENO_GPU_GEN::A7X && moe_lowbit_env && atoi(moe_lowbit_env) != 0;
+    std::string moe_lowbit_src;
+    if (use_moe_lowbit) {
+#ifdef GGML_OPENCL_EMBED_KERNELS
+        moe_lowbit_src =
+            #include "mul_mv_id_lowbit.cl.h"
+            ;
+#else
+        moe_lowbit_src = read_file("mul_mv_id_lowbit.cl");
+#endif
+    }
+
+    auto load_moe_lowbit = [&](const std::string & kernel_src, const char * name) -> cl_kernel {
+        if (!use_moe_lowbit) {
+            return nullptr;
+        }
+        const std::string source = moe_lowbit_src + kernel_src;
+        cl_program program = build_program_from_source(backend_ctx, source.c_str(),
+            compile_opts + " -DGGML_OPENCL_MOE_LOWBIT", false);
+        if (!program) {
+            return nullptr;
+        }
+        cl_int status;
+        cl_kernel kernel = clCreateKernel(program, name, &status);
+        CL_CHECK(clReleaseProgram(program));
+        if (status != CL_SUCCESS) {
+            return nullptr;
+        }
+        if (backend_ctx->get_kernel_workgroup_size(kernel) < 64) {
+            CL_CHECK(clReleaseKernel(kernel));
+            return nullptr;
+        }
+        return kernel;
+    };
+#endif
+
     // mul_mv_q2_k_f32_flat
     {
 #ifdef GGML_OPENCL_EMBED_KERNELS
@@ -2947,6 +2991,11 @@ static void load_cl_kernels(ggml_backend_opencl_context *backend_ctx) {
         cl_program prog = build_program_from_source(backend_ctx, kernel_src.c_str(), compile_opts);
         CL_CHECK((backend_ctx->kernel_mul_mv_q2_K_f32_flat = clCreateKernel(prog, "kernel_mul_mv_q2_K_f32_flat", &err), err));
         CL_CHECK(clReleaseProgram(prog));
+#ifdef GGML_OPENCL_USE_ADRENO_KERNELS
+        if (use_moe_lowbit) {
+            backend_ctx->kernel_mul_mv_id_q2_K_f32_flat = load_moe_lowbit(kernel_src, "kernel_mul_mv_id_q2_K_f32_flat");
+        }
+#endif
         GGML_LOG_CONT(".");
     }
 
@@ -2994,6 +3043,11 @@ static void load_cl_kernels(ggml_backend_opencl_context *backend_ctx) {
         cl_program prog = build_program_from_source(backend_ctx, kernel_src.c_str(), compile_opts);
         CL_CHECK((backend_ctx->kernel_mul_mv_q3_K_f32_flat = clCreateKernel(prog, "kernel_mul_mv_q3_K_f32_flat", &err), err));
         CL_CHECK(clReleaseProgram(prog));
+#ifdef GGML_OPENCL_USE_ADRENO_KERNELS
+        if (use_moe_lowbit) {
+            backend_ctx->kernel_mul_mv_id_q3_K_f32_flat = load_moe_lowbit(kernel_src, "kernel_mul_mv_id_q3_K_f32_flat");
+        }
+#endif
         GGML_LOG_CONT(".");
     }
 
@@ -3032,6 +3086,11 @@ static void load_cl_kernels(ggml_backend_opencl_context *backend_ctx) {
         cl_program prog = build_program_from_source(backend_ctx, (iq2_s_grid_src + kernel_src).c_str(), compile_opts);
         CL_CHECK((backend_ctx->kernel_mul_mv_iq2_s_f32_flat = clCreateKernel(prog, "kernel_mul_mv_iq2_s_f32_flat", &err), err));
         CL_CHECK(clReleaseProgram(prog));
+#ifdef GGML_OPENCL_USE_ADRENO_KERNELS
+        if (use_moe_lowbit) {
+            backend_ctx->kernel_mul_mv_id_iq2_s_f32_flat = load_moe_lowbit(iq2_s_grid_src + kernel_src, "kernel_mul_mv_id_iq2_s_f32_flat");
+        }
+#endif
         GGML_LOG_CONT(".");
     }
 
@@ -3070,6 +3129,11 @@ static void load_cl_kernels(ggml_backend_opencl_context *backend_ctx) {
         cl_program prog = build_program_from_source(backend_ctx, (iq2_xs_grid_src + kernel_src).c_str(), compile_opts);
         CL_CHECK((backend_ctx->kernel_mul_mv_iq2_xs_f32_flat = clCreateKernel(prog, "kernel_mul_mv_iq2_xs_f32_flat", &err), err));
         CL_CHECK(clReleaseProgram(prog));
+#ifdef GGML_OPENCL_USE_ADRENO_KERNELS
+        if (use_moe_lowbit) {
+            backend_ctx->kernel_mul_mv_id_iq2_xs_f32_flat = load_moe_lowbit(iq2_xs_grid_src + kernel_src, "kernel_mul_mv_id_iq2_xs_f32_flat");
+        }
+#endif
         GGML_LOG_CONT(".");
     }
 
@@ -3108,6 +3172,11 @@ static void load_cl_kernels(ggml_backend_opencl_context *backend_ctx) {
         cl_program prog = build_program_from_source(backend_ctx, (iq2_xxs_grid_src + kernel_src).c_str(), compile_opts);
         CL_CHECK((backend_ctx->kernel_mul_mv_iq2_xxs_f32_flat = clCreateKernel(prog, "kernel_mul_mv_iq2_xxs_f32_flat", &err), err));
         CL_CHECK(clReleaseProgram(prog));
+#ifdef GGML_OPENCL_USE_ADRENO_KERNELS
+        if (use_moe_lowbit) {
+            backend_ctx->kernel_mul_mv_id_iq2_xxs_f32_flat = load_moe_lowbit(iq2_xxs_grid_src + kernel_src, "kernel_mul_mv_id_iq2_xxs_f32_flat");
+        }
+#endif
         GGML_LOG_CONT(".");
     }
 
@@ -3358,6 +3427,11 @@ static void load_cl_kernels(ggml_backend_opencl_context *backend_ctx) {
         cl_program prog = build_program_from_source(backend_ctx, (iq3_s_grid_src + kernel_src).c_str(), compile_opts);
         CL_CHECK((backend_ctx->kernel_mul_mv_iq3_s_f32_flat = clCreateKernel(prog, "kernel_mul_mv_iq3_s_f32_flat", &err), err));
         CL_CHECK(clReleaseProgram(prog));
+#ifdef GGML_OPENCL_USE_ADRENO_KERNELS
+        if (use_moe_lowbit) {
+            backend_ctx->kernel_mul_mv_id_iq3_s_f32_flat = load_moe_lowbit(iq3_s_grid_src + kernel_src, "kernel_mul_mv_id_iq3_s_f32_flat");
+        }
+#endif
         GGML_LOG_CONT(".");
     }
 
@@ -12238,6 +12312,36 @@ static bool ggml_cl_mul_mat_can_use_fwht(const ggml_backend_opencl_context * bac
            ggml_is_contiguous_rows(b) && ggml_is_contiguous(op) && ggml_are_same_shape(b, op);
 }
 
+#if defined(GGML_OPENCL_SOA_Q) && defined(GGML_OPENCL_USE_ADRENO_KERNELS)
+static cl_kernel ggml_cl_moe_lowbit_kernel(const ggml_backend_opencl_context * ctx, ggml_type type) {
+    switch (type) {
+        case GGML_TYPE_Q2_K:    return ctx->kernel_mul_mv_id_q2_K_f32_flat;
+        case GGML_TYPE_Q3_K:    return ctx->kernel_mul_mv_id_q3_K_f32_flat;
+        case GGML_TYPE_IQ2_S:   return ctx->kernel_mul_mv_id_iq2_s_f32_flat;
+        case GGML_TYPE_IQ2_XS:  return ctx->kernel_mul_mv_id_iq2_xs_f32_flat;
+        case GGML_TYPE_IQ2_XXS: return ctx->kernel_mul_mv_id_iq2_xxs_f32_flat;
+        case GGML_TYPE_IQ3_S:   return ctx->kernel_mul_mv_id_iq3_s_f32_flat;
+        default:                return nullptr;
+    }
+}
+
+static bool ggml_cl_supports_moe_lowbit(const ggml_backend_opencl_context * ctx, const ggml_tensor * op) {
+    const ggml_tensor * weights = op->src[0];
+    const ggml_tensor * activations = op->src[1];
+    const ggml_tensor * ids = op->src[2];
+
+    // Multiple experts use the flat SoA layout. Single matrices may be transposed at upload.
+    return ggml_cl_moe_lowbit_kernel(ctx, weights->type) &&
+           weights->ne[2] > 1 && weights->view_src == nullptr && ggml_is_contiguous(weights) &&
+           activations->type == GGML_TYPE_F32 && activations->nb[0] == sizeof(float) &&
+           ids->type == GGML_TYPE_I32 && ids->nb[0] == sizeof(int32_t) &&
+           op->type == GGML_TYPE_F32 && op->nb[0] == sizeof(float) &&
+           weights->ne[0] <= INT_MAX - 2048 && weights->ne[1] <= INT_MAX - 4 &&
+           activations->ne[1] <= INT_MAX && ids->ne[0] <= INT_MAX && ids->ne[1] <= INT_MAX &&
+           ggml_prec_get_src(op, 1) != GGML_PREC_BF16;
+}
+#endif
+
 static bool ggml_opencl_supports_op(ggml_backend_dev_t dev, const struct ggml_tensor * op) {
     ggml_backend_opencl_device_context * dev_ctx     = (ggml_backend_opencl_device_context *)dev->context;
     ggml_backend_opencl_context *        backend_ctx = dev_ctx->backend_ctx;
@@ -12598,6 +12702,11 @@ static bool ggml_opencl_supports_op(ggml_backend_dev_t dev, const struct ggml_te
             }
             return false;
         case GGML_OP_MUL_MAT_ID:
+#if defined(GGML_OPENCL_SOA_Q) && defined(GGML_OPENCL_USE_ADRENO_KERNELS)
+            if (ggml_cl_supports_moe_lowbit(backend_ctx, op)) {
+                return true;
+            }
+#endif
             if (op->src[0]->type == GGML_TYPE_F32 || op->src[0]->type == GGML_TYPE_F16 || op->src[0]->type == GGML_TYPE_BF16) {
                 return op->src[1]->type == GGML_TYPE_F32 && op->src[2]->type == GGML_TYPE_I32 && op->type == GGML_TYPE_F32 &&
                        op->src[0]->nb[0] == ggml_type_size(op->src[0]->type) && op->src[1]->nb[0] == sizeof(float) &&
@@ -36403,6 +36512,97 @@ static void ggml_cl_mul_mat_id_float(ggml_backend_t backend, const ggml_tensor *
     backend_ctx->enqueue_ndrange_kernel(kernel, 3, global_work_size, local_work_size, dst);
 }
 
+#if defined(GGML_OPENCL_SOA_Q) && defined(GGML_OPENCL_USE_ADRENO_KERNELS)
+static void ggml_cl_mul_mat_id_lowbit(ggml_backend_opencl_context * ctx, ggml_tensor * dst) {
+    const ggml_tensor * weights = dst->src[0];
+    const ggml_tensor * activations = dst->src[1];
+    const ggml_tensor * ids = dst->src[2];
+    auto * act_extra = static_cast<ggml_tensor_extra_cl *>(activations->extra);
+    auto * ids_extra = static_cast<ggml_tensor_extra_cl *>(ids->extra);
+    auto * dst_extra = static_cast<ggml_tensor_extra_cl *>(dst->extra);
+    const cl_kernel kernel = ggml_cl_moe_lowbit_kernel(ctx, weights->type);
+
+    cl_uint arg = 0;
+    auto set_arg = [&](auto value) {
+        CL_CHECK(clSetKernelArg(kernel, arg++, sizeof(value), &value));
+    };
+    switch (weights->type) {
+        case GGML_TYPE_Q2_K: {
+            const auto * extra = static_cast<const ggml_tensor_extra_cl_q2_K *>(weights->extra);
+            set_arg(extra->qs);
+            set_arg(extra->sc);
+            set_arg(extra->dm);
+            break;
+        }
+        case GGML_TYPE_Q3_K: {
+            const auto * extra = static_cast<const ggml_tensor_extra_cl_q3_K *>(weights->extra);
+            set_arg(extra->qs);
+            set_arg(extra->hm);
+            set_arg(extra->sc);
+            set_arg(extra->d);
+            break;
+        }
+        case GGML_TYPE_IQ3_S: {
+            const auto * extra = static_cast<const ggml_tensor_extra_cl_iq3_s *>(weights->extra);
+            set_arg(extra->qs);
+            set_arg(extra->sg);
+            set_arg(extra->qh);
+            set_arg(extra->sc);
+            set_arg(extra->d);
+            break;
+        }
+        case GGML_TYPE_IQ2_S: {
+            const auto * extra = static_cast<const ggml_tensor_extra_cl_iq2_s *>(weights->extra);
+            set_arg(extra->qs);
+            set_arg(extra->sg);
+            set_arg(extra->qh);
+            set_arg(extra->sc);
+            set_arg(extra->d);
+            break;
+        }
+        case GGML_TYPE_IQ2_XS: {
+            const auto * extra = static_cast<const ggml_tensor_extra_cl_iq2_xs *>(weights->extra);
+            set_arg(extra->qs);
+            set_arg(extra->sc);
+            set_arg(extra->d);
+            break;
+        }
+        case GGML_TYPE_IQ2_XXS: {
+            const auto * extra = static_cast<const ggml_tensor_extra_cl_iq2_xxs *>(weights->extra);
+            set_arg(extra->qs);
+            set_arg(extra->sas);
+            set_arg(extra->d);
+            break;
+        }
+        default:
+            GGML_ABORT("unsupported low-bit expert weight type");
+    }
+    set_arg(act_extra->data_device);
+    set_arg(cl_ulong(act_extra->offset + activations->view_offs));
+    set_arg(ids_extra->data_device);
+    set_arg(cl_ulong(ids_extra->offset + ids->view_offs));
+    set_arg(dst_extra->data_device);
+    set_arg(cl_ulong(dst_extra->offset + dst->view_offs));
+    set_arg(cl_int(weights->ne[0]));
+    set_arg(cl_int(weights->ne[1]));
+    set_arg(cl_ulong(weights->nb[1]));
+    set_arg(cl_ulong(weights->nb[2]));
+    set_arg(cl_int(activations->ne[1]));
+    set_arg(cl_ulong(activations->nb[1]));
+    set_arg(cl_ulong(activations->nb[2]));
+    set_arg(cl_ulong(ids->nb[1]));
+    set_arg(cl_ulong(dst->nb[1]));
+    set_arg(cl_ulong(dst->nb[2]));
+
+    // Match N_DST for each 64-lane subgroup.
+    const int rows_per_group = weights->type == GGML_TYPE_Q3_K ? 2 : 4;
+    size_t local[3] = {64, 1, 1};
+    size_t global[3] = {size_t(CEIL_DIV(weights->ne[1], rows_per_group)) * local[0],
+                        size_t(ids->ne[0]), size_t(ids->ne[1])};
+    ctx->enqueue_ndrange_kernel(kernel, 3, global, local, dst);
+}
+#endif
+
 static void ggml_cl_mul_mat_id(ggml_backend_t backend, const ggml_tensor * src0, const ggml_tensor * src1, ggml_tensor * dst) {
     if (src0->type == GGML_TYPE_F32 || src0->type == GGML_TYPE_F16 || src0->type == GGML_TYPE_BF16) {
         ggml_cl_mul_mat_id_float(backend, src0, src1, dst);
@@ -36421,6 +36621,13 @@ static void ggml_cl_mul_mat_id(ggml_backend_t backend, const ggml_tensor * src0,
     GGML_ASSERT(src2->extra);
 
     ggml_backend_opencl_context *backend_ctx = (ggml_backend_opencl_context *)backend->context;
+
+#if defined(GGML_OPENCL_SOA_Q) && defined(GGML_OPENCL_USE_ADRENO_KERNELS)
+    if (ggml_cl_supports_moe_lowbit(backend_ctx, dst)) {
+        ggml_cl_mul_mat_id_lowbit(backend_ctx, dst);
+        return;
+    }
+#endif
 
     ggml_tensor_extra_cl * extra0 = (ggml_tensor_extra_cl *)src0->extra;
     ggml_tensor_extra_cl * extra1 = (ggml_tensor_extra_cl *)src1->extra;

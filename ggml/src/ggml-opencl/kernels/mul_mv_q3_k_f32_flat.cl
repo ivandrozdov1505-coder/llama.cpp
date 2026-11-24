@@ -49,11 +49,18 @@ REQD_SUBGROUP_SIZE_16
 #elif defined (ADRENO_GPU)
 REQD_SUBGROUP_SIZE_64
 #endif
+#ifdef GGML_OPENCL_MOE_LOWBIT
+kernel void kernel_mul_mv_id_q3_K_f32_flat(
+#else
 kernel void kernel_mul_mv_q3_K_f32_flat(
+#endif
         global uchar * src0_qs,
         global uchar * src0_hm,
         global uchar * src0_sc,
         global half * src0_d,
+#ifdef GGML_OPENCL_MOE_LOWBIT
+        MUL_MV_ID_LOWBIT_ARGS
+#else
         ulong offset0,
         global char * src1,
         ulong offset1,
@@ -72,6 +79,7 @@ kernel void kernel_mul_mv_q3_K_f32_flat(
         int ne1,
         int r2,
         int r3
+#endif
 ) {
     src1 = src1 + offset1;
     dst  = dst  + offsetd;
@@ -79,16 +87,30 @@ kernel void kernel_mul_mv_q3_K_f32_flat(
     int nb = ne00/QK_K;
 
     int r0 = get_group_id(0);
-    int r1 = get_group_id(1);
-    int im = get_group_id(2);
     int first_row = (r0 * N_SIMDGROUP + get_sub_group_id()) * N_DST;
 
+#ifdef GGML_OPENCL_MOE_LOWBIT
+    const uint slot = get_group_id(1);
+    const uint token = get_group_id(2);
+    const int expert = ((global const int *) (ids + offset_ids + token*nb_ids))[slot];
+    global float * dst_f32 = (global float *) (dst + slot*nbd1 + token*nbd2);
+    if (expert == -1) {
+        mul_mv_id_lowbit_zero(dst_f32, first_row, ne01, N_DST);
+        return;
+    }
+    const ulong offset_src0 = (first_row*nb01 + (ulong) expert*nb02)/sizeof(block_q3_K);
+    const ulong offset_src1 = (slot % ne11)*nb11 + token*nb12;
+#else
+    int r1 = get_group_id(1);
+    int im = get_group_id(2);
     int i12 = im%ne12;
     int i13 = im/ne12;
 
     ulong offset_src0 = (offset0 + first_row*nb01 + (i12/r2)*nb02 + (i13/r3)*nb03)/sizeof(block_q3_K);
-    ulong row_stride = nb01/sizeof(block_q3_K);
     ulong offset_src1 =        r1*nb11 + (i12   )*nb12 + (i13   )*nb13;
+    global float * dst_f32 = (global float *) dst + im*ne0*ne1 + r1*ne0;
+#endif
+    ulong row_stride = nb01/sizeof(block_q3_K);
 
     global float      * yy = (global float      *) (src1 + offset_src1);
 
@@ -185,8 +207,6 @@ kernel void kernel_mul_mv_q3_K_f32_flat(
 
         y1 += BLOCK_STRIDE * QK_K;
     }
-
-    global float * dst_f32 = (global float *) dst + im*ne0*ne1 + r1*ne0;
 
     for (int row = 0; row < N_DST; ++row) {
         all_sum = sub_group_reduce_add((sumf1[row] + 0.25f * sumf2[row]) / (1 << shift));

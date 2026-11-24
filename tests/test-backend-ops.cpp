@@ -12808,6 +12808,13 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
         }
     }
 
+    // Low-bit experts with a tail row, offset routing IDs and skipped slots.
+    for (ggml_type type : {GGML_TYPE_Q2_K, GGML_TYPE_Q3_K, GGML_TYPE_IQ2_S, GGML_TYPE_IQ2_XS, GGML_TYPE_IQ2_XXS, GGML_TYPE_IQ3_S}) {
+        for (int n : {1, 17}) {
+            test_cases.emplace_back(new test_mul_mat_id(type, GGML_TYPE_F32, 8, 4, true, 65, n, 2560, 0, true, true));
+        }
+    }
+
     // Both experts receive every token
     for (ggml_type type : {GGML_TYPE_Q2_K, GGML_TYPE_Q3_K, GGML_TYPE_Q4_K}) {
         for (int n : {64, 65}) {

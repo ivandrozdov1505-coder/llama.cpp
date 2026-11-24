@@ -74,6 +74,22 @@ However, A6x GPUs in phones are likely not supported due to the outdated driver 
 
 `MUL_MAT_ID` accepts an expert id of `-1` and writes zeros to that slot. `ADD_ID` adds no bias for `-1`, including in fused MoE operations.
 
+### Low-bit MoE on Adreno 7xx
+
+Set `GGML_OPENCL_ADRENO_LOWBIT_MOE=1` to enable the experimental
+`MUL_MAT_ID` kernels for `Q2_K`, `Q3_K`, `IQ2_S`, `IQ2_XS`,
+`IQ2_XXS` and `IQ3_S` expert tensors. This includes mixed quants
+such as Inkling 2 Mini `Q2_K`, where down projections can use `Q3_K`.
+These kernels require `GGML_OPENCL_USE_ADRENO_KERNELS=ON` and use the
+existing flat OpenCL weight layout.
+
+Compare prompt processing and token generation with the same model, GPU layer count and batch sizes:
+
+```sh
+GGML_OPENCL_ADRENO_LOWBIT_MOE=0 llama-bench -m "$MODEL" -ngl 8 -p 256 -n 128 -r 3
+GGML_OPENCL_ADRENO_LOWBIT_MOE=1 llama-bench -m "$MODEL" -ngl 8 -p 256 -n 128 -r 3
+```
+
 ## Model Preparation
 
 Since common quantizations are supported now, it is recommanded to download GGUF models directly from Huggingface.
